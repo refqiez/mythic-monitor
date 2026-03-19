@@ -1,0 +1,28 @@
+version = "0.1"
+
+[load0]
+clip = "bored.webp"
+load1 = "$sensor > 0.2"
+
+[load1]
+clip = "walk.webp"
+load0 = "$sensor < 0.2"
+load2 = "$sensor > 0.4"
+
+[load2]
+clip = "run.webp"
+load1 = "$sensor < 0.4"
+load3 = "$sensor > 0.6"
+
+[load3]
+clip = "dash.webp"
+load2 = "$sensor < 0.6"
+load4_start = "$sensor > 0.8"
+
+[load4_start]
+clip = "crouch.webp"
+load4 = ""
+
+[load4]
+clip = "balldash.webp"
+load3 = "$sensor < 0.8"

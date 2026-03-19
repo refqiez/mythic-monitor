@@ -1,0 +1,2 @@
+max-log-level = "debug"
+num-log-files = 3

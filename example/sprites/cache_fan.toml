@@ -1,0 +1,9 @@
+# example of transition implementing latching behavior
+
+[idle] # entry state
+sprite = "fan_idle.webp"
+stressed = "fan.ema > .6"
+
+[stressed]
+sprite = "fan_stressed.webp"
+idle = "fan.ema < .4"

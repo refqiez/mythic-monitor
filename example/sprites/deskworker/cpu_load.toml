@@ -1,0 +1,38 @@
+mythic_version = "1.0.0"
+
+# each section describes a state.
+# each field of a section (except 'clip') denotes transition.
+# field value defines transition condition.
+
+[init] # the fist state is a init state (entry point)
+clip = "cpu_start.webp" # sprite to use
+low = "cpu.ema < 0.3" # .ema for exponential moving average
+mid = "cpu.ema < 0.6" # transition conditions tested in order
+high = "" # empty condition is always true; acts as fallback
+
+[low]
+# can specify wegith for the clip selection
+clip = { cpu_low.webp = 99, cpu_low_surprise.webp = 1 }
+low = "cpu.ema < 0.3"
+mid = "cpu.ema < 0.6"
+low_to_high = ""
+
+[mid]
+clip = "cpu_mid.webp"
+low = "cpu.ema < 0.3"
+mid = "cpu.ema < 0.6"
+high = ""
+
+[high]
+clip = "cpu_high.webp"
+high_to_low = "cpu.ema < 0.3"
+mid = "cpu.ema < 0.6"
+# stays in current state when nothing matches
+
+[low_to_high]
+clip = "cpu_low2high.webp"
+high = "" # goto high after 1 iteration of cpu_low2high.webp
+
+[high_to_low]
+clip = "cpu_high2low.webp"
+low = "" # goto low after 1 iteration of cpu_low2high.webp

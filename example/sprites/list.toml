@@ -1,0 +1,29 @@
+version = "0.1"
+
+# [cpu_load]
+# width = 200
+# height = 200
+# pos_x = 100
+# pos_y = 100
+
+# [gpu_load]
+# width = 200
+# height = 200
+# pos_x = 200
+# pos_y = 100
+
+[sonic1]
+sprite = "sonic"
+param.sensor = "epoch.sec.100"
+size.width = 100
+size.height = 100
+pos.bottom = 150
+pos.xcenter = 100
+
+# [sonic2]
+# sprite = "sonic"
+# param.sensor = "cpu"
+# size.width = 100
+# size.height = 100
+# pos.bottom = 350
+# pos.xcenter = 100
