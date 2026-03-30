@@ -10,8 +10,8 @@ Boolean: true, false
 Float: 3.14, 0.5, 123.456  (must contain decimal point)
 ```
 
-Note that floats are decimal representation only.
-No scientific notation.
+Note that floats are in decimal representation only.
+No scientific notations.
 
 
 ## Identifier path

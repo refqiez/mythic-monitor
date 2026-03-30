@@ -53,7 +53,7 @@ impl LexError {
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum Token {
     // literals
-    Float(f32),
+    Float(f64),
     Bool(bool),
 
     // identifiers / keywords
@@ -215,7 +215,7 @@ impl<'src> Lexer<'src> {
                     }
                 }
 
-                let Ok(v) = self.src[start .. self.pos].parse::<f32>() else {
+                let Ok(v) = self.src[start .. self.pos].parse::<f64>() else {
                     return Err(LexError::invalid(start, self.pos));
                 };
 
@@ -361,7 +361,7 @@ pub enum BinOp {
 
 #[derive(Debug)]
 pub enum Expr {
-    Float(f32),
+    Float(f64),
     Bool(bool),
     Ident(Span),
     Sensing(SensingId),
@@ -783,7 +783,7 @@ pub fn unregister(
 #[derive(Clone, Copy)]
 pub union Value {
     pub bool: bool,
-    pub float: f32,
+    pub float: f64,
 }
 
 pub fn eval_expr(
@@ -798,7 +798,7 @@ pub fn eval_expr(
         Expr::Float(f) => Value { float: *f },
         Expr::Ident(_span) => panic!("Cannot evaluate un-sanitized Expr"),
         Expr::Sensing(rid) => {
-            resolver.resolve_value(*rid).expect("Cannot evaluate un-sanitized Expr")
+            resolver.resolve_value(*rid)
         }
         Expr::Unary { op, expr: inner } => {
             let val = eval_expr(arena, *inner, resolver);

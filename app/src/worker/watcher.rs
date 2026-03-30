@@ -22,7 +22,9 @@ pub struct WindowUpdate {
     pub kind: WindowUpdateKind,
 }
 
-pub struct SensingUpdate {
+pub enum SensingUpdate {
+    #[cfg(debug_assertions)]
+    PluginDebugUpdage,
 }
 
 pub struct DirectoryWatcher {
@@ -54,23 +56,23 @@ impl DirectoryWatcher {
 
         let sprite_path = &crate::base::path().sprite;
         if let Err(e) = watcher.watch(sprite_path, notify::RecursiveMode::Recursive) {
-            log::error!("could not install notify watcher for {sprite_path} ({e})");
+            log::error!("could not install notify watcher for '{sprite_path}' ({e})");
         } else {
-            log::info!("installed notify watcher for {sprite_path}");
+            log::info!("installed notify watcher for '{sprite_path}'");
         }
 
         let plugin_path = &crate::base::path().plugin;
         if let Err(e) = watcher.watch(plugin_path, notify::RecursiveMode::Recursive) {
-            log::info!("could not install notify watcher for {plugin_path} ({e})");
+            log::info!("could not install notify watcher for '{plugin_path}' ({e})");
         } else {
-            log::info!("installed notify watcher for {plugin_path}");
+            log::info!("installed notify watcher for '{plugin_path}'");
         }
 
         let running_path = &crate::base::path().running;
         if let Err(e) = watcher.watch(running_path, notify::RecursiveMode::NonRecursive) {
-            log::info!("could not install notify watcher for {running_path} ({e})");
+            log::info!("could not install notify watcher for '{running_path}' ({e})");
         } else {
-            log::info!("installed notify watcher for {running_path}");
+            log::info!("installed notify watcher for '{running_path}'");
         }
 
         let mut dirty: HashSet<AppPath> = HashSet::new();
@@ -111,7 +113,7 @@ impl DirectoryWatcher {
             // wait for next event to happen
             if let Ok(Ok(res)) = rx.recv() {
                 if let Some(path) = filter_notify_event(res) {
-                    log::debug!("got watcher event (wake) {path}");
+                    log::debug!("got watcher event (wake) '{path}'");
                     dirty.insert(path);
                 }
             }
@@ -119,14 +121,14 @@ impl DirectoryWatcher {
             // keep collecting till there's no updates for a duration
             while let Ok(Ok(res)) = rx.recv_timeout(debounce_duration) {
                 if let Some(path) = filter_notify_event(res) {
-                    log::debug!("got watcher event (following) {path}");
+                    log::debug!("got watcher event (following) '{path}'");
                     dirty.insert(path);
                 }
             }
 
             // process the updated files
             for path in dirty.drain() {
-                log::debug!("processing updated file {path}");
+                log::debug!("processing updated file '{path}'");
                 let keep_going = self.handle_file_reload(&path);
                 if keep_going != 0 { break 'outer keep_going == 2; }
             }
@@ -150,8 +152,12 @@ impl DirectoryWatcher {
                 return if crate::base::path().running.exists() {0} else {1};
             }
 
+            #[cfg(debug_assertions)]
+            AppPathAnalisys::PluginDebug => {
+                self.sensing_update_queue.send(SensingUpdate::PluginDebugUpdage);
+            }
+
             AppPathAnalisys::Plugin(_)  => {
-                // self.sensing_update_queue.send()
                 return 2;
             }
 
@@ -167,7 +173,7 @@ impl DirectoryWatcher {
     }
 
     pub fn reload_list_toml(&mut self, path: &AppPath) {
-        log::info!("reloading list_toml at {path}");
+        log::info!("reloading list_toml at '{path}'");
         let mut sprites = self.sprites.write().expect("poisoned sprites lock");
         let mut sensors = self.sensors.write().expect("poisoned sensors lock");
         let mut clipbank= self.clipbank.write().expect("poisoned clipbank lock");
@@ -178,7 +184,7 @@ impl DirectoryWatcher {
     }
 
     pub fn reload_sprite_toml(&mut self, path: &AppPath) {
-        log::info!("reloading sprite_toml with {path}");
+        log::info!("reloading sprite_toml with '{path}'");
         // FIXME this may result in no updates, but we still acquires lock.
         // this may unnecessarily stagger the watcher if there is many un-tracked toml files are added to the directory
         let mut sprites = self.sprites.write().expect("poisoned sprites lock");
@@ -198,7 +204,7 @@ impl DirectoryWatcher {
         // this may unnecessarily stagger the watcher if there is many un-tracked image files are added to the directory
         for (clipid, err) in clipbank.reload(path) {
             if let Some(e) = err {
-                log::error!("could not reload clip from {path} ({e:?})"); // FIXME more gracefull error report
+                log::error!("could not reload clip from '{path}' ({e:?})"); // FIXME more gracefull error report
                 break;
             }
 

@@ -277,7 +277,7 @@ impl TryFrom<PathBuf> for AppPath {
 
 impl std::fmt::Display for AppPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "'{}'", self.as_rel().to_string_lossy())
+        write!(f, "{}", self.as_rel().to_string_lossy())
     }
 }
 
@@ -286,6 +286,8 @@ pub enum AppPathAnalisys<'p> {
     Sprite(&'p Path), // .toml file in toml dir
     Clip  (&'p Path), // .webp file in sprite dir
     Plugin(&'p Path), // .dll/.so file in plugin dir
+    #[cfg(debug_assertions)]
+    PluginDebug,      // debug.toml file in plugin dir
     TempL (&'p Path), // loaded plugin files
     SpriteList, // sprites/list.toml
     Running,    // misc/running
@@ -315,6 +317,13 @@ pub fn analize_path(path: &AppPath) -> AppPathAnalisys<'_> {
 
     } else if let Ok(stripped_path) = path.strip_prefix(&glob.plugin) {
         // plugin
+
+        #[cfg(debug_assertions)]
+        {
+            if stripped_path == Path::new("debug.toml") {
+                return AppPathAnalisys::PluginDebug;
+            }
+        }
 
         #[cfg(target_os = "windows")]
         {
@@ -516,24 +525,55 @@ pub fn o3_hungarian(n: usize, m: usize, cost: impl Fn (usize, usize) -> i32) -> 
 }
 
 
+/// Gets utf8 sequence of digits, parse u8 number.
+/// This code rejects any non-digit character.
+/// Numeric digits are ascii characters to be represented with single byte < 0xC0, so it's fine.
+pub const fn parse_simple_u8(s: &[u8]) -> Option<u8> {
+    const fn upd(r: &mut u8, d: u8) -> bool {
+        if d > b'9' { return false; }
+        let Some(d) = d.checked_sub(b'0') else {return false};
+        let Some(nr) = r.checked_mul(10) else {return false};
+        let Some(nr) = nr.checked_add(d) else {return false};
+        *r = nr; true
+    }
+    let mut r = 0u8;
+    if s.len() > 0 { if ! upd(&mut r, s[0]) { return None; } }
+    if s.len() > 1 { if ! upd(&mut r, s[1]) { return None; } }
+    if s.len() > 2 { if ! upd(&mut r, s[2]) { return None; } }
+    if s.len() > 3 { return None }
+    Some(r)
+}
+
+/// Gets utf16 sequence of digits, parse u8 number.
+/// This code rejects any non-digit character.
+/// Numeric digits are ascii characters to be represented with single byte < 0xC0, so it's fine.
+pub const fn parse_simple_u8w(s: &[u16]) -> Option<u8> {
+    const fn upd(r: &mut u8, d: u16) -> bool {
+        let d = if d <= b'9' as u16 {d as u8} else {return false};
+        let Some(d) = d.checked_sub(b'0') else {return false};
+        let Some(nr) = r.checked_mul(10) else {return false};
+        let Some(nr) = nr.checked_add(d) else {return false};
+        *r = nr; true
+    }
+    let mut r = 0u8;
+    if s.len() > 0 { if ! upd(&mut r, s[0]) { return None; } }
+    if s.len() > 1 { if ! upd(&mut r, s[1]) { return None; } }
+    if s.len() > 2 { if ! upd(&mut r, s[2]) { return None; } }
+    if s.len() > 3 { return None }
+    Some(r)
+}
+
+
 pub struct Version {
     pub major: u8,
     pub minor: u8,
 }
 
 pub const MYTHIC_VERSION: Version = Version {
-    major: parse_u8(env!("CARGO_PKG_VERSION_MAJOR")),
-    minor: parse_u8(env!("CARGO_PKG_VERSION_MINOR")),
+    major: parse_simple_u8(env!("CARGO_PKG_VERSION_MAJOR").as_bytes()).unwrap(),
+    minor: parse_simple_u8(env!("CARGO_PKG_VERSION_MINOR").as_bytes()).unwrap(),
 };
 
-const fn parse_u8(s: &str) -> u8 {
-    let mut r = 0;
-    let s = s.as_bytes();
-    if s.len() > 0 { r += (s[0] - b'0') * 1; }
-    if s.len() > 1 { r += (s[1] - b'0') * 10; }
-    if s.len() > 2 { r += (s[2] - b'0') * 100; }
-    r
-}
 
 pub fn is_version_compatible(spec: &str) -> Option<bool> {
 

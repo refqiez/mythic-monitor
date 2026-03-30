@@ -287,7 +287,7 @@ impl Renderer {
     pub fn run(&mut self) -> Result<()> {
         log::info!("WindowsRednerer started runing");
         loop {
-            log::trace!("window update iteration");
+            // log::trace!("window update iteration");
 
             let now = Instant::now();
             let wait_duration = match self.queue.peek() {
@@ -301,7 +301,7 @@ impl Renderer {
                 None => Duration::from_secs(1),
             };
 
-            log::trace!("wait_duration: {wait_duration:?}");
+            // log::trace!("wait_duration: {wait_duration:?}");
             match self.interface.update_queue.recv_timeout(wait_duration) {
                 Ok(upd) =>
                     self.process_update(upd)?,

@@ -13,7 +13,7 @@ pub trait TypeResolver {
 }
 
 pub trait ValueResolver {
-    fn resolve_value(&self, sid: SensingId) -> Option<expr::Value>;
+    fn resolve_value(&self, sid: SensingId) -> expr::Value;
 }
 
 // wrapper to enable 'rollback' of registerations when error occurs
@@ -49,18 +49,33 @@ impl TypeResolver for SensorsWrapper<'_> {
             self.params.lookup(param).ok_or(expr::SemanticError::UnknownParam(ident.to_string()))
         }).collect::<Result<String, _>>()?;
 
-        if let Some((t, sid)) = self.inner.register(&path) {
-            self.registered.push(sid);
-            Ok((t, sid))
-        } else {
-            Err(expr::SemanticError::UnknownIdentifier(path))
+        match self.inner.register(&path) {
+            Ok((t, sid)) => {
+                self.registered.push(sid);
+                Ok((t, sid))
+            }
+            Err((name, opaque)) => {
+                // FIXME reuse report_opaque_error from poller?
+                use crate::sensing::OpaqueErrorMsgFail;
+                let message = match opaque.message {
+                    Ok(s) => format!("[{name}] {s}"),
+                    Err(OpaqueErrorMsgFail::Error(e)) => format!("[{name}] <ERR {e}; {}>", opaque.errcode),
+                    Err(OpaqueErrorMsgFail::Null) => format!("[{name}] <NULL; {}>", opaque.errcode),
+                    Err(OpaqueErrorMsgFail::NotUtf8(s)) =>
+                        format!("[{name}] {s}{}..<UTF8 ERR; {}>", char::REPLACEMENT_CHARACTER, opaque.errcode),
+                };
+                Err(expr::SemanticError::UnknownIdentifier(message))
+            }
         }
     }
 }
 
 impl<'a> ValueResolver for Sensors {
-    fn resolve_value(&self, sid: SensingId) -> Option<expr::Value> {
-        self.read(sid)
+    fn resolve_value(&self, sid: SensingId) -> expr::Value {
+        // self.read(sid)
+        let val = self.read(sid);
+        log::trace!("reading value: {sid:?} = {}", unsafe { val.float } );
+        val
     }
 }
 
@@ -126,7 +141,19 @@ impl ConditionExpr {
 
     pub fn unload(self, sensors: &mut Sensors) {
         let Some(inner) = self.inner else { return };
-        expr::unregister(&inner.arena, inner.root, &mut |sid| sensors.unregister(sid));
+        expr::unregister(&inner.arena, inner.root, &mut |sid|
+            // FIXME report errors up?
+            if let Err((name, e)) = sensors.unregister(sid) {
+                use crate::sensing::OpaqueErrorMsgFail;
+                let message = match e.message {
+                    Ok(s) => format!("[{name}] {s} while unloading"),
+                    Err(OpaqueErrorMsgFail::Error(e)) => format!("[{name}] <ERR {e}> while unloading"),
+                    Err(OpaqueErrorMsgFail::Null) => format!("[{name}] <NULL>while unloading"),
+                    Err(OpaqueErrorMsgFail::NotUtf8(s)) =>
+                        format!("[{name}] {s}{}..<UTF8 ERR> while unloading", char::REPLACEMENT_CHARACTER),
+                };
+            }
+        );
     }
 
     pub fn eval(&self, resolver: &impl ValueResolver) -> bool {
@@ -254,9 +281,9 @@ impl<'src> Display for ControllerLoadReport<'src> {
                                 write!(f, "parameter '{param}' is not recognized")
                                 // TODO add Did you mean?
                             ),
-                        UnknownIdentifier(path) =>
+                        UnknownIdentifier(message) =>
                             message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                                write!(f, "identifier path '{path}' is not recognized")
+                                write!(f, "identifier path is not recognized: {message}")
                                 // TODO add Did you mean?
                             ),
                         TypeMismatch { expected, found, } =>
@@ -365,7 +392,7 @@ struct Transition {
 #[derive(Debug)]
 struct State {
     name: String,
-    clips: Vec<(ClipId, f32)>, // weight, clip
+    clips: Vec<(ClipId, f64)>, // weight, clip
     trans: Vec<Transition>
 }
 
@@ -380,11 +407,11 @@ pub struct SpriteController {
 }
 
 impl SpriteController {
-    fn rand(&mut self) -> f32 {
+    fn rand(&mut self) -> f64 {
         // 2 param xor shift
         self.rand_state ^= self.rand_state << 7;
         self.rand_state ^= self.rand_state >> 9;
-        (self.rand_state as f32) / (u64::MAX as f32)
+        (self.rand_state as f64) / (u64::MAX as f64)
     }
 
     // this method is too bulky, and does many things to load a sprite description. we may improve it by..
@@ -401,7 +428,7 @@ impl SpriteController {
         let src = match std::fs::read_to_string(file) {
             Ok(src) => src,
             Err(e) => {
-                log::error!("cannot read file {file}: {e}");
+                log::error!("cannot read file '{file}': {e}");
                 return None;
             }
         };
@@ -479,7 +506,7 @@ impl SpriteController {
                 }
             }
 
-            let mut clip_infos: Vec<(WithPos<&Path>, f32, Option<u32>)> = vec![]; // path, weight, loop_count_override
+            let mut clip_infos: Vec<(WithPos<&Path>, f64, Option<f64>)> = vec![]; // path, weight, loop_count_override
             for clip_entry in table.pop_all("clip") {
                 match clip_entry.val.val {
                     toml::Value::String(path) => {
@@ -652,7 +679,7 @@ impl SpriteController {
 
     fn choose_clip(&mut self) {
         let state = &self.states[self.current_state.0];
-        let sum: f32 = state.clips.iter().map(|(_c,w)| w).sum();
+        let sum: f64 = state.clips.iter().map(|(_c,w)| w).sum();
 
         let choice = self.rand() * sum;
 

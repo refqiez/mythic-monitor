@@ -51,35 +51,30 @@ struct SpriteDeclLoadReport<'src> {
 }
 
 
-#[derive(Debug)]
+// keys in 'inner' are always in certain order, we can simply compare them for equality without lookups
+#[derive(Debug, PartialEq, Eq)]
 pub struct Params {
-    params: Vec<(String, String)>,
+    // always sorted in reverse of lexical order of the parameter keys
+    inner: Vec<(String, String)>,
 }
 
 impl<'src> Params {
-    pub fn new() -> Self {
-        Self { params: vec![] }
+    pub fn new(mut pairs: Vec<(String, String)>) -> Self {
+        // stable sort using param keys to collect duplicated keys in appearing order
+        pairs.sort_by(|kv1, kv2| kv1.0.cmp(&kv2.0));
+        pairs.reverse(); // dedup leaves first of the consecutives, we want the last.
+        pairs.dedup_by(|kv1,kv2| kv1.0 == kv2.0);
+        Self { inner: pairs }
     }
 
     pub fn lookup(&self, name: &str) -> Option<&str> {
-        self.params.iter().rfind(|x| x.0 == name).map(|x| x.1.as_str())
+        self.inner.iter().rfind(|x| x.0 == name).map(|x| x.1.as_str())
     }
 
     pub fn set(&mut self, name: &'src str, val: &'src str) {
-        self.params.push((name.into(), val.into()))
+        self.inner.push((name.into(), val.into()))
     }
 }
-
-impl PartialEq for Params {
-    fn eq(&self, other: &Self) -> bool {
-        if self.params.len() != other.params.len() { return false; }
-
-        self.params.iter().all(|(name, _val)|
-            other.lookup(name).is_some()
-        )
-    }
-}
-
 
 // parsed from toml table. as-is.
 #[derive(Debug)]
@@ -243,11 +238,11 @@ impl SpriteDecl {
             let height = section.pop("size.height");
 
             let width = if let Some(entry) = width {
-                Some(*extract::<f32>(&entry)? as usize)
+                Some(*extract::<f64>(&entry)? as usize)
             } else { None };
 
             let height = if let Some(entry) = height {
-                Some(*extract::<f32>(&entry)? as usize)
+                Some(*extract::<f64>(&entry)? as usize)
             } else { None };
 
             if width.is_none() || height.is_none() {
@@ -263,9 +258,9 @@ impl SpriteDecl {
             let right  = section.pop("pos.right");
             let xpos = match (left, xcenter, right) {
                 (None, None, None) => return Err(WithPos { pos: section_pos, val: SpriteDeclLoadReportKind::NoHorizontalPosition }),
-                (Some(entry), _, _) => (Align::Start, *extract::<f32>(&entry)? as i32),
-                (None, Some(entry), _) => (Align::Center, *extract::<f32>(&entry)? as i32),
-                (None, None, Some(entry)) => (Align::End, *extract::<f32>(&entry)? as i32),
+                (Some(entry), _, _) => (Align::Start, *extract::<f64>(&entry)? as i32),
+                (None, Some(entry), _) => (Align::Center, *extract::<f64>(&entry)? as i32),
+                (None, None, Some(entry)) => (Align::End, *extract::<f64>(&entry)? as i32),
             };
 
             let top   = section.pop("pos.top");
@@ -273,18 +268,18 @@ impl SpriteDecl {
             let bottom  = section.pop("pos.bottom");
             let ypos = match (top, ycenter, bottom) {
                 (None, None, None) => return Err(WithPos { pos: section_pos, val: SpriteDeclLoadReportKind::NoVerticalPosition }),
-                (Some(entry), _, _) => (Align::Start, *extract::<f32>(&entry)? as i32),
-                (None, Some(entry), _) => (Align::Center, *extract::<f32>(&entry)? as i32),
-                (None, None, Some(entry)) => (Align::End, *extract::<f32>(&entry)? as i32),
+                (Some(entry), _, _) => (Align::Start, *extract::<f64>(&entry)? as i32),
+                (None, Some(entry), _) => (Align::Center, *extract::<f64>(&entry)? as i32),
+                (None, None, Some(entry)) => (Align::End, *extract::<f64>(&entry)? as i32),
             };
 
             (xpos, ypos)
         };
 
-        let params  = section.pop_all_with_prefix("param.").map(|entry| -> Result<(String, String), WithPos<SpriteDeclLoadReportKind<'src>>> {
+        let mut params  = section.pop_all_with_prefix("param.").map(|entry| -> Result<(String, String), WithPos<SpriteDeclLoadReportKind<'src>>> {
             Ok((entry.key.val.strip_prefix("param.").unwrap().to_string(), extract::<&str>(&entry)?.to_string())) // TODO support other value types
         }).collect::<Result<Vec<_>, _>>()?;
-        let params = Params { params };
+        let params = Params::new(params);
 
         Ok(Self { size, xpos, ypos, path, params, name: name.into(), sprite: None })
     }
@@ -592,7 +587,6 @@ impl Sprites {
             if cur_decl.path != other_decl.path || cur_decl.params != other_decl.params {
                 cur_decl.path = other_decl.path;
                 cur_decl.params = other_decl.params;
-                cur_decl.sprite = None;
                 need_reload = true;
                 need_redraw = true;
                 need_reschedule = true;

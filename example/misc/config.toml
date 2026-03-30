@@ -1,2 +1,2 @@
-max-log-level = "debug"
+max-log-level = "trace"
 num-log-files = 3

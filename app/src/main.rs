@@ -79,7 +79,7 @@ fn load_config_and_init_log(file_logging: bool) {
 
     let num_log_files =
         config.pop("num-log-files").map(|nlf_ent|
-            nlf_ent.val.val.extract::<f32>().map(|&nlf|
+            nlf_ent.val.val.extract::<f64>().map(|&nlf|
                 (nlf as i32).clamp(0, 100) as u8
             ).map_err(|e| nlf_ent.val.pos.with(e))
         ).unwrap_or(Ok(default_nlf));
@@ -322,6 +322,11 @@ fn run() -> bool {
     let mut clipbank = clipbank.write().expect("poisoned clipbank lock");
     let mut sensors = sensors.write().expect("poisoned sensors lock");
     sprites.unload(&mut sensors, &mut clipbank);
+
+    for (name, e) in sensors.refresh() {
+        // FIXME should be done in poller? we are doing it here to ensure every thing referencing sensors are not running anymore.
+        worker::poller::report_opaque_error(name, "destroy", e);
+    }
 
     should_restart
 }

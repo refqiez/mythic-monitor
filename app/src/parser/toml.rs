@@ -66,7 +66,7 @@ impl From<WithPos<LexError>> for WithPos<ParseError<'static>> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Token<'src> {
     Identifier(&'src str),
-    Number(f32),
+    Number(f64),
     Boolean(bool),
     String(&'src str),
     Equals,
@@ -242,7 +242,7 @@ impl<'src> Lexer<'src> {
                 }
                 let s = &self.input[start..end];
                 pos.span = Span { start, end };
-                let num: f32 = s.parse().map_err(|_| WithPos { val: LexError::InvalidNumber, pos })?;
+                let num: f64 = s.parse().map_err(|_| WithPos { val: LexError::InvalidNumber, pos })?;
                 Ok(WithPos { val: Token::Number(num), pos })
             }
             _ => Err(WithPos { val: LexError::UnexpectedChar, pos }),
@@ -256,7 +256,7 @@ impl<'src> Lexer<'src> {
 #[derive(Debug, Clone)]
 pub enum Value<'src> {
     String(&'src str),
-    Number(f32),
+    Number(f64),
     Boolean(bool),
     Array(Vec<WithPos<Value<'src>>>),
     Table(Table<'src>),
@@ -315,7 +315,7 @@ macro_rules! extract_value_impl {
 }
 
 extract_value_impl!{&'src str, "string", String}
-extract_value_impl!{f32, "number", Number}
+extract_value_impl!{f64, "number", Number}
 extract_value_impl!{bool, "boolean", Boolean}
 extract_value_impl!{Vec<WithPos<Value<'src>>>, "array", Array}
 extract_value_impl!{Table<'src>, "table", Table}

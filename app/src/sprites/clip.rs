@@ -240,7 +240,7 @@ impl ClipBank {
         ) {
             let clipid = ClipId(idx);
 
-            log::debug!("clipbank.load({}, {:?}, {:?}) => {:?} using cached, rc: {} -> {}", path, size.width, size.height, clipid, rc, *rc+1);
+            log::debug!("clipbank.load('{}', {:?}, {:?}) => {:?} using cached, rc: {} -> {}", path, size.width, size.height, clipid, rc, *rc+1);
             *rc += 1;
             return Ok(clipid);
         }
@@ -256,7 +256,7 @@ impl ClipBank {
         };
 
         let clipid = ClipId(idx);
-        log::debug!("clipbank.load({}, {:?}, {:?}) => {:?} adding new, rc: {} -> {}", path, size.width, size.height, clipid, 0, 1);
+        log::debug!("clipbank.load('{}', {:?}, {:?}) => {:?} adding new, rc: {} -> {}", path, size.width, size.height, clipid, 0, 1);
         Ok(clipid)
     }
 

@@ -204,13 +204,26 @@ Fields:
 **Available Sensing Values:**
 
 Thease are bulitin sensing keys. More keys will be available via future updates and plugins.
-- `cpu`:  total cpu usage (%)
-- `cpu.num`: number of cpu cores
-- `mem.p`: memory usage (%)
-- `disk.read`: total disk read speed (bytes/s)
-- `disk.write`: total disk write speed (bytes/s)
-- `net.up`: total network upload speed (bytes/s)
-- `net.down`: total network download speed (bytes/s)
+- `cpu`: Total cpu usage (%, 0 to 1)
+    + `.num`: Number of cpu cores
+    + `.{i}` Cpu usage of `i`'th core (up to 255 cores)
+- `mem`: Memory usage (%, 0 to 1)
+    + `.total`: Total memory size (bytes)
+    + `.avail`: Available memory size (bytes)
+- `disk`
+    + `.read`: total disk read speed (bytes/s)
+    + `.write`: total disk write speed (bytes/s)
+    + `.{drivelabel}`: if the drive with `drivelabel` is detected (boolean)
+        * `.read`: disk read speed for drive with `drivelabel` (bytes/s)
+        * `.write`: disk write speed for drive with `drivelabel` (bytes/s)
+- `net`:
+    + `.up`: total network upload speed (bytes/s)
+    + `.down`: total network download speed (bytes/s)
+    + `.{interfacename}`: if the interface with `interfacename` is present (boolean)
+        * `.up`: network uploadspeed for interface with `interfacename` (bytes/s)
+        * `.down`: network download speed for interface with `interfacename` (bytes/s)
+
+All above sensing keys except for `disk.{disklabel}` and `net.{interfacename}`, . can have `.ema.{p}` suffix. It provides exponential moving average of the value with weight `0.p`. (e.g. `cpu.3.ema.02` will return usage of 3rd core, with ema coefficient `0.02`)
 
 ```toml
 # exampls
@@ -219,7 +232,7 @@ clip = "bored.webp"
 load1 = "$sensor > 0.2" # using $sensor parameter
 
 [load1]
-# this clip will be skpped when transition arrived at this state with
+# this clip will be skipped when transition arrives at this state with
 # $sensor value < 0.2 or > 0.4
 clip = { path = "walk.webp", loop_count = 0 }
 load0 = "$sensor < 0.2"
@@ -326,19 +339,44 @@ typedef struct ABI {
     uint8_t  version_minor;
     uint8_t  tier;
 
-    void*  (*create)(void);
-    void   (*destroy)(void* instance);
-    void   (*refresh)(void* instance);
-    float  (*read)(void* instance, uint16_t sensing_id);
-    uint16_t (*_register)(void* instance, const uint8_t* identifier, uint64_t length);
-    void (*unregister)(void* instance, uint16_t sensing_id);
-
+    // Creates internal data buffer for a instance and assign the pointer for it.
+    // This data buffer *should* contain all the sensing values for every keys registered.
+    uint32_t (*create)(void** instance);
+    // Destroy internal data (returned from 'create') for a instance.
+    uint32_t (*destroy)(void* instance);
+    // Collect data, refresh the sensing values as needed.
+    // This method will be called periodically as specified in 'tier'.
+    // Set 0 for boolean value to indicate false, non zero otherwise.
+    uint32_t (*refresh)(void* instance);
+    // Given an identifier string , return the sensing id.
+    // The idenfifier string is gven in utf8 encoding, with plugin name prefix stripped.
+    // If the plugin can provide sensing value for requested identifier it should set valid sensing id ot 'out'.
+    // Sensing id structure:
+    //     16            15                 8                 0
+    //      | type (1 bit)| custom (7 bits) | offset (8 bits) |
+    //     type: 0 for float, 1 for boolean
+    //     custom: plugins are free to put any info here.
+    //     offset: 64 bit stride offset of the sensing value from the start of the instance pointer.
+    // The following routine (or equivalent) will be used When the system reads the sensing value
+    //     val = ((double*) instance)[sid & 0xFF]
+    //     (out & 0x8000) ? (val == 0.0) : (val)
+    // On error, put a 1-based index of errorneous identifier field (sperated by '.') to 'out',
+    // or 0 (default) to refer to the whole identifier path.
+    uint32_t (*_register)(void* instance, const uint8_t* ident, uint64_t ident_len, uint16_t *out);
+    // This will be called when one of the sprites that uses sensing_id unloads.
+    // If you don't manager reference count of sensing metrics, you can ignore this call.
+    uint32_t (*unregister)(void* instance, uint16_t sensing_id);
+    // All the methods should return an nonzero-error code to indicate error. (0 on success)
+    // This method should provide a single line message (without newline) describing the error state.
+    // The message string must persist until next time 'message' is called for this instance.
+    // 'instance' may be NULL if the plugin failed during 'create'.
+    uint32_t (*message)(void* instance, uint32_t errcode, const uint8_t** msg, uint64_t* msg_len);
 } ABI;
 ```
 
 ## Compatibility
 
-The ABI contains compatibility metadata:
+The ABI contains metadata for compatibility check:
 
 | Field           | Requirements |
 | --------------- | ------- |
@@ -351,16 +389,17 @@ The ABI contains compatibility metadata:
 The host interacts with plugins using the following lifecycle:
 
 1. Create instance (`create`)
-    The instance will be used throughout the lifetime.  If creation fails, the function must return NULL.
+    The instance will be used throughout the lifetime. If creation fails, the function must return NULL.
 
 2. Register identifiers (`register`)
-    This gets called for any identifier found in TCEs. Should return the sensng ID. Return 0 if the identifier is not recognized.
+    This gets called for any identifier found in TCEs. Should return the sensng ID.
 
 3. Periodic refresh (`refresh`)
     The plugins poll external data sources and update cached sensing values.
 
-4. Read values (`read`)
-    This gets called when evaluating TCEs. Given sensing ID, it should return corresponding values (cached from the last refresh).
+4. Read values
+    The system read values from instance pointer using offset found in sensing_id.
+    This gets called when evaluating TCEs.
 
 5. Unregister identifiers (`unregister`)
     Called when TCE holding a sensing ID is unloaded.
@@ -370,12 +409,12 @@ The host interacts with plugins using the following lifecycle:
 
 Points of concern:
 - One could manage refcount for sensing IDs (with `regiseter` and `unregister`) and only poll required metrics during the refresh.
-- `read` may be called concurrently while other methods are called exclusively.
-- Plugins should not perform polling in read. It should be lightweight operation.
-- Sensing ID only needs to be consistent during a lifetime.
-- If `register` sucesses, the subsequent `read` call is assumed to be valid. Make sure to poll & cache the value if have not.
+- All the method calls are mutually exclusive.
+- If `register` sucesses, read of the value should be valid. Make sure to poll & cache the value after registration of new metric.
 - Identifier path string given to `register` must not be modified or kept. The string is only valid for the duration of the register call.
-- Critical errors (memory corruption, invalid pointer access, etc) in plugins will directly effect the host. Do **everything** to be safe.
+- Critical errors (memory corruption, invalid pointer access, etc) in plugins will directly effect the host. Do **everything** to remain safe.
+- If `message` fails, its returned error code will not be processed further, and will be reported as a bug. Don't try to recover failures in this method. (e.g. giving message "unknown errcode")
+- There will only be single instance created at at time for each loaded plugin. So you can use static buffer for instance data.
 
 ## Refreshing Period
 
@@ -389,103 +428,20 @@ For example, if the host have 9 (0.5s), 12 (4s), 20 (1024s) tier schedules, `ref
 
 ## Minimal Example
 
-When loaded, this plugin will provide two sensing metrics 'epoch.time.10' and 'epoch.time.100' with expected refreshing period of 0.5 seconds.
-
-on linux
-```
-gcc -c -Wall -Werror -fPIC epoch.c -shared -o epoch.so
-```
-or on windows
-```
-gcc -shared -o epoch.dll epoch.c
+See [counter.c][examples/plugins/counter.c]. You can build it with following using gcc:
+```bash
+# on linux
+gcc -c -Wall -Werror -fPIC counter.c -shared -o counter.so
+# on windows
+gcc -shared -o counter.dll counter.c
 ```
 
-```c
-// epoch.c
-#include <stdint.h>
-#include <stdlib.h>
-#include <time.h>
-#include <string.h>
+When loaded, this plugin will provide three sensing metrics
+- `counter.sec.1`: seconds elapsed since plugin load (float)
+- `counter.sec.10`: seconds elapsed since plugin load, devided by 10 (float)
+- `counter.over5s`: true if 5 seconds has passed since load (boolean)
 
-typedef struct ABI_t {
-    uint32_t magic;
-    uint8_t version_major;
-    uint8_t version_minor;
-    uint8_t tier;
-
-    void*  (*create)(void);
-    void   (*destroy)(void*);
-    void   (*refresh)(void*);
-    float  (*read)(void*, uint16_t);
-    uint16_t (*_register)(void*, const uint8_t*, uint64_t);
-    void   (*unregister)(void*, uint16_t);
-} ABI;
-
-typedef struct {
-    int refcount; // minimal example, one dummy id
-    float value; // cached sensing value
-} Instance;
-
-static void* create(void) {
-    Instance* inst = malloc(sizeof(Instance));
-    if (!inst) return NULL;
-    inst->refcount = 0;
-    inst->value = 0;
-    return inst;
-}
-
-static void destroy(void* instance) {
-    if (!instance) return;
-    free(instance);
-}
-
-static void refresh(void* instance) {
-    Instance* inst = (Instance*)instance;
-    if (inst->refcount > 0) {
-        inst->value = (float)(time(NULL) % 1000);
-    }
-}
-
-static float read(void* instance, uint16_t sensing_id) {
-    Instance* inst = (Instance*)instance;
-    if (sensing_id == 1)
-        return inst->value / 10;
-    if (sensing_id == 2)
-        return inst->value / 100;
-    return 0.0f;
-}
-
-static uint16_t _register(void* instance, const uint8_t* identifier, uint64_t length) {
-    const char* ident = (const char*)identifier;
-    Instance* inst = (Instance*)instance;
-    if (strncmp("sec.10", ident, length)) {
-        inst->refcount += 1;
-        refresh(instance);
-        return 1;
-    }
-    if (strncmp("sec.100", ident, length)) {
-        inst->refcount += 1;
-        refresh(instance);
-        return 2;
-    }
-    return 0; // invalid id
-}
-
-static void unregister(void* instance, uint16_t sensing_id) {
-    Instance* inst = (Instance*)instance;
-    if (sensing_id == 1 || sensing_id == 2) inst->refcount -= 0;
-}
-
-static ABI VTABLE = {
-    0x5ABAD0B1, 0, 1, 9,
-    create, destroy, refresh, read,
-    _register, unregister
-};
-
-// Plugin entry point
-__attribute__((visibility("default")))
-ABI* get_vtable(void) { return &VTABLE; }
-```
+The plugin increament internal timer with every refresh, skipping when refcount is 0.
 
 <!-- # Performance -- TODO -->
 
@@ -517,3 +473,5 @@ See LICENSE.txt for details.
 - [ ] partial update when sprite.toml updates
 - [ ] plugin refresh tier
     + currently, the tier is overridden to 9
+- [ ] smart name recognition for builtin sensors
+    + currently, builtin sensors requires **exact** device name / interface name that pdh use

@@ -1,4 +1,4 @@
-version = "0.1"
+version = "0.0"
 
 # [cpu_load]
 # width = 200
@@ -14,7 +14,7 @@ version = "0.1"
 
 [sonic1]
 sprite = "sonic"
-param.sensor = "epoch.sec.100"
+param.sensor = "counter.sec.10"
 size.width = 100
 size.height = 100
 pos.bottom = 150
