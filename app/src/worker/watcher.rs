@@ -1,4 +1,4 @@
-use crate::base::{AppPath, analize_path, AppPathAnalisys};
+use crate::base::{AppPath, analize_path, app_paths, AppPathAnalisys};
 use crate::sensing::Sensors;
 use crate::sprites::{ClipBank, SpriteId, Sprites};
 
@@ -54,21 +54,21 @@ impl DirectoryWatcher {
         let (tx, rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(tx).unwrap();
 
-        let sprite_path = &crate::base::path().sprite;
+        let sprite_path = &app_paths().sprite;
         if let Err(e) = watcher.watch(sprite_path, notify::RecursiveMode::Recursive) {
             log::error!("could not install notify watcher for '{sprite_path}' ({e})");
         } else {
             log::info!("installed notify watcher for '{sprite_path}'");
         }
 
-        let plugin_path = &crate::base::path().plugin;
+        let plugin_path = &app_paths().plugin;
         if let Err(e) = watcher.watch(plugin_path, notify::RecursiveMode::Recursive) {
             log::info!("could not install notify watcher for '{plugin_path}' ({e})");
         } else {
             log::info!("installed notify watcher for '{plugin_path}'");
         }
 
-        let running_path = &crate::base::path().running;
+        let running_path = &app_paths().running;
         if let Err(e) = watcher.watch(running_path, notify::RecursiveMode::NonRecursive) {
             log::info!("could not install notify watcher for '{running_path}' ({e})");
         } else {
@@ -149,12 +149,12 @@ impl DirectoryWatcher {
 
             AppPathAnalisys::Running    => {
                 // halt if not exist
-                return if crate::base::path().running.exists() {0} else {1};
+                return if app_paths().running.exists() {0} else {1};
             }
 
             #[cfg(debug_assertions)]
             AppPathAnalisys::PluginDebug => {
-                self.sensing_update_queue.send(SensingUpdate::PluginDebugUpdage);
+                _ = self.sensing_update_queue.send(SensingUpdate::PluginDebugUpdage);
             }
 
             AppPathAnalisys::Plugin(_)  => {

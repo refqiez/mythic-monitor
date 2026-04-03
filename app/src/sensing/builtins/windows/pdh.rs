@@ -75,7 +75,6 @@ use windows::{
     core::*
     // Win32::Graphics::Dxgi::Common::*,
 };
-use std::collections::HashMap;
 use std::mem;
 
 use crate::base::parse_simple_u8w;

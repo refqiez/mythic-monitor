@@ -65,10 +65,9 @@ impl SenseKind {
     }
 
     fn parse(path: &str) -> Result<(SenseKind, f64), OpaqueError<'static>> {
-        use crate::base::{parse_simple_u8};
         fn split_number_prefix(s: &str) -> Option<(u32, &'_ str)> {
             let Some(s) = s.strip_prefix('.') else { return None };
-            let prefix_len = s.char_indices().find(|(i,c)| !c.is_digit(10)).map(|(i,c)| i).unwrap_or(s.len());
+            let prefix_len = s.char_indices().find(|(_,c)| !c.is_digit(10)).map(|(i,_)| i).unwrap_or(s.len());
             if prefix_len == 0 { return None; }
             let (prefix, rest) = (&s[..prefix_len], &s[prefix_len..]); // s[s.len()..] is safe, returns empty string
             prefix.parse::<u32>().ok().map(|num| (num, rest))
@@ -84,14 +83,14 @@ impl SenseKind {
 
         fn split_interfacename_prefix(s: &str) -> Option<(&'_ str, &'_ str)> {
             let Some(s) = s.strip_prefix('.') else { return None };
-            let prefix_len = s.char_indices().find(|(i,c)| *c != '.').map(|(i,c)| i).unwrap_or(s.len());
+            let prefix_len = s.char_indices().find(|(_,c)| *c != '.').map(|(i,_)| i).unwrap_or(s.len());
             if prefix_len == 0 { return None; }
             Some((&s[..prefix_len], &s[prefix_len..]))
         }
 
         fn split_ema_prefix(s: &str) -> Option<(f64, &'_ str)> {
             let Some(s) = s.strip_prefix(".ema.") else { return None };
-            let num_len = s.char_indices().find(|(i,c)| !c.is_digit(10)).map(|(i,c)| i).unwrap_or(s.len());
+            let num_len = s.char_indices().find(|(_,c)| !c.is_digit(10)).map(|(i,_)| i).unwrap_or(s.len());
             if num_len == 0 { return None; }
             let effective_num_len = std::cmp::min(10, num_len); // significance will be cut by EMA_EPSILON anyway
             let num = s[..effective_num_len].parse::<u32>().ok()?;
@@ -304,7 +303,7 @@ impl BuiltinSensor {
                 }
 
                 Ram(_) => {
-                    let (success, mut caches) =
+                    let (success, caches) =
                         if let Some(caches) = self.inner.get_ram_stat() {
                             (true, caches)
                         } else {
@@ -389,14 +388,14 @@ impl BuiltinSensor {
                 // search empty slot backward
                 let recycle = self.idmap[..i]
                     .iter().enumerate().rev()
-                    .take_while(|(i, x)| x.kind == item.kind)
-                    .find(|(i, x)| x.rc == 0);
+                    .take_while(|(_, x)| x.kind == item.kind)
+                    .find(|(_, x)| x.rc == 0);
 
                 // search empty slot forwared
                 let recycle = recycle.or_else(|| self.idmap[i..] // arr[arr.len()..] is safe
                     .iter().enumerate()
-                    .take_while(|(i, x)| x.kind == item.kind)
-                    .find(|(i, x)| x.rc == 0)
+                    .take_while(|(_, x)| x.kind == item.kind)
+                    .find(|(_, x)| x.rc == 0)
                 );
 
                 // Note that elements in idmap and data have 1-to-1 relation, only that
@@ -457,6 +456,7 @@ impl BuiltinSensor {
     }
 
     // consume and drop self. pdh.drop will release pdh resources
+    #[allow(unused)]
     pub fn destroy(self) {
     }
 }

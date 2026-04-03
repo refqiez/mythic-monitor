@@ -14,12 +14,44 @@ pub struct Pos {
 impl Span {
     pub fn nil() -> Self { Self { start: 0, end: 0 }}
     pub fn whole(s: &str) -> Self { Self { start: 0, end: s.len() } }
+    pub fn ending(s: &str) -> Self { Self { start: s.len(), end: s.len() } }
 
     pub fn with<T>(&self, val: T) -> WithSpan<T> {
         WithSpan {
             span: *self,
             val,
         }
+    }
+
+    // should later be implemented with Pattern once it is stable in rustc
+    pub fn split<'a>(orig: &'a str, pat: char) -> impl Iterator<Item=Span> + use<'a> {
+        orig.split(pat).map(|s| {
+            let start = unsafe { s.as_ptr().offset_from(orig.as_ptr()) } as usize;
+            Span { start, end: start + s.len() }
+        })
+    }
+
+    /// Reverse of Span::nest.
+    /// If B is included in A:
+    ///   A.frame(B).unframe(A) == B
+    pub fn unframe(&self, parent: Span) -> Self {
+        *self + parent.start
+    }
+
+    /// Consider two Spans:
+    ///   A = 0 [1  2  3  4  5] 6  == {start:1, end:6}
+    ///   B = 0  1  2 [3  4] 5  6  == {start:3, end:5}
+    /// A.frame(B) = {start:2, end:4}
+    /// the result will be clamped if out of range
+    pub fn frame(&self, nest: Span) -> Self {
+        let parent_len = self.end - self.start;
+        let start = nest.start.saturating_sub(self.start);
+        let end = std::cmp::min(parent_len, nest.end.saturating_sub(self.start));
+        Span { start, end }
+    }
+
+    pub fn slice<'a>(&self, s: &'a str) -> &'a str {
+        &s[self.start .. self.end]
     }
 }
 
@@ -65,6 +97,13 @@ impl<T> WithSpan<T> {
         WithSpan {
             span: self.span,
             val: f(self.val),
+        }
+    }
+
+    pub fn unframe(self, parent: Span) -> Self {
+        Self {
+            val: self.val,
+            span: self.span.unframe(parent),
         }
     }
 }
@@ -113,7 +152,7 @@ pub fn message_with_evidence(
     lineno: usize,
     buf: &str, // source of the situation
     span: Option<Span>, // byte offset in the buf for the range of interest
-    message: impl FnOnce(&mut std::fmt::Formatter) -> std::fmt::Result,
+    message: std::fmt::Arguments,
 ) -> std::fmt::Result {
     use std::cmp::{min, max};
 
@@ -121,9 +160,7 @@ pub fn message_with_evidence(
         for _ in 0 .. pad { write!(f, " ")?; } Ok(())
     }
 
-    write!(f, "{}: ", crate::base::level_as_str(level))?;
-    message(f)?;
-    writeln!(f)?;
+    writeln!(f, "{}: {message}", crate::base::logger::level_as_str(level))?;
 
     let pad = 3 + if lineno == 0 {0} else {lineno.ilog(10)};
     write_pad(f, pad-1)?;

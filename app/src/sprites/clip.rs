@@ -1,6 +1,6 @@
 use libwebp_sys::*;
 use std::{fs, mem, ptr};
-use crate::base::{AutoSize, AppPath};
+use crate::base::{AutoSize, AppPath, CoroutineIter};
 
 /// A single decoded frame of animation
 struct Frame {
@@ -184,36 +184,6 @@ pub struct ClipBank {
     clips: Vec<Option<(Clip, u32)>> // none if unloaded, (clip, rc)
 }
 
-#[must_use]
-pub struct ReloadIter<'a, I: Iterator<Item=(usize, &'a mut (Clip, u32))>> {
-    iter: I,
-}
-
-impl<'a, I> Iterator for ReloadIter<'a, I> where I: Iterator<Item=(usize, &'a mut (Clip, u32))> {
-    type Item = (ClipId, Option<ClipLoadError>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|(idx, (clip, _rc))| {
-            match Clip::load_webp(&clip.path, AutoSize::new(Some(clip.width), Some(clip.height))) {
-                Ok(new_clip) => {
-                    *clip  = new_clip;
-                    (ClipId(idx), None)
-                }
-                Err(e) => {
-                    (ClipId(idx), Some(e))
-                }
-            }
-        })
-    }
-}
-
-impl<'a, I> Drop for ReloadIter<'a, I> where I: Iterator<Item=(usize, &'a mut (Clip, u32))> {
-    fn drop(&mut self) {
-        self.for_each(drop);
-    }
-}
-
-
 impl ClipBank {
     pub fn new() -> Self {
         Self { clips: vec![] }
@@ -278,10 +248,22 @@ impl ClipBank {
     /// Returned iterator gives the clipids of updated clips, acompanied with possible clip load error.
     /// The reloading process is on-the-go; clips get reloaded as the ReloadIter iterator is consumed.
     /// If droped, the iterator will consume itself guraranteeing reload of all relevant clips.
-    pub fn reload<'path>(&mut self, path: &'path AppPath) -> ReloadIter<'_, impl Iterator<Item=(usize, &'_ mut (Clip, u32))> + use<'_, 'path>> {
+    pub fn reload<'path>(&mut self, path: &'path AppPath) -> CoroutineIter<(ClipId, Option<ClipLoadError>), impl Iterator<Item=(ClipId, Option<ClipLoadError>)> + use<'_, 'path>> {
         let iter = self.clips.iter_mut().enumerate()
         .filter_map(|(i,e)| e.as_mut().map(|e| (i,e)))
-        .filter(move |e| &e.1.0.path == path);
-        ReloadIter { iter }
+        .filter(move |e| &e.1.0.path == path)
+        .map(|(idx, (clip, _rc))| {
+            match Clip::load_webp(&clip.path, AutoSize::new(Some(clip.width), Some(clip.height))) {
+                Ok(new_clip) => {
+                    *clip  = new_clip;
+                    (ClipId(idx), None)
+                }
+                Err(e) => {
+                    (ClipId(idx), Some(e))
+                }
+            }
+        });
+
+        CoroutineIter::new(iter)
     }
 }

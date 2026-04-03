@@ -59,7 +59,7 @@ impl Sensors {
             return Err(SensorPrepareError::DuplicatedName);
         }
 
-        let dst = crate::base::path().templ(path.file_name().unwrap());
+        let dst = crate::base::app_paths().templ(path.file_name().unwrap());
         if let Err(e) = std::fs::copy(path, &dst) {
             return Err(SensorPrepareError::CouldNotReserve(e));
         };

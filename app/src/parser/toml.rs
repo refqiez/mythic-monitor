@@ -1,5 +1,4 @@
 use super::{Span, Pos, WithPos, message_with_evidence};
-use std::fmt;
 
 /// Lexical error
 
@@ -12,19 +11,19 @@ pub enum LexError {
 
 /// Parsing error
 #[derive(Debug, Clone)]
-pub enum ParseError<'src> {
-    UnexpectedToken { found: Token<'src>, expected: String },
+pub enum ParseError {
+    UnexpectedToken { found: &'static str, expected: String },
     Unrecognized(LexError),
 }
 
-impl<'src> ParseError<'src> {
-    fn unexpected_(tok: WithPos<Token<'src>>, expected: String) -> WithPos<Self> {
+impl ParseError {
+    fn unexpected_(tok: WithPos<Token>, expected: String) -> WithPos<Self> {
         tok.map(|tok| ParseError::UnexpectedToken {
-            found: tok, expected,
+            found: tok.repr(), expected,
         })
     }
 
-    fn unexpected(tok: WithPos<Token<'src>>, expected: &str) -> WithPos<Self> {
+    fn unexpected(tok: WithPos<Token>, expected: &str) -> WithPos<Self> {
         Self::unexpected_(tok, expected.to_string())
     }
 
@@ -40,8 +39,8 @@ impl<'src> ParseError<'src> {
         match self {
             UnexpectedToken { found, expected } => {
                 // TODO remove self.lieno?
-                message_with_evidence(f, Error, file, lineno, buf, span, |f|
-                    write!(f, "unexpected {}, expecting {}", found.repr(), expected)
+                message_with_evidence(f, Error, file, lineno, buf, span,
+                    format_args!("unexpected {}, expecting {}", found, expected)
                 )
             }
             Unrecognized(lex_error) => {
@@ -51,15 +50,15 @@ impl<'src> ParseError<'src> {
                     InvalidNumber => "invalid number",
                     UnexpectedChar => "unexpected char",
                 };
-                message_with_evidence(f, Error, file, lineno, buf, span, |f|
-                    write!(f, "{}", msg)
+                message_with_evidence(f, Error, file, lineno, buf, span,
+                    format_args!("{}", msg)
                 )
             }
         }
     }
 }
 
-impl From<WithPos<LexError>> for WithPos<ParseError<'static>> {
+impl From<WithPos<LexError>> for WithPos<ParseError> {
     fn from(e: WithPos<LexError>) -> Self { e.map(ParseError::Unrecognized) }
 }
 
@@ -95,7 +94,6 @@ impl Token<'_> {
             RBrace => "'}'",
             Newline => "newline",
             Eof => "EOF",
-
         }
     }
 }
@@ -342,7 +340,7 @@ impl<'src> Parser<'src> {
         Self { lexer: Lexer::new(input), peeked: None }
     }
 
-    fn peek(&mut self) -> Result<WithPos<Token<'src>>, WithPos<ParseError<'src>>> {
+    fn peek(&mut self) -> Result<WithPos<Token<'src>>, WithPos<ParseError>> {
         if self.peeked.is_none() { // if initial peek
             self.peeked = Some(self.lexer.next_token());
         }
@@ -353,7 +351,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn next(&mut self) -> Result<WithPos<Token<'src>>, WithPos<ParseError<'src>>> {
+    fn next(&mut self) -> Result<WithPos<Token<'src>>, WithPos<ParseError>> {
         Ok(if let Some(tok) = self.peeked.take() {
             tok?
         } else {
@@ -361,7 +359,7 @@ impl<'src> Parser<'src> {
         })
     }
 
-    fn expect(&mut self, kind: Token<'src>) -> Result<WithPos<Token<'src>>, WithPos<ParseError<'src>>> {
+    fn expect(&mut self, kind: Token<'src>) -> Result<WithPos<Token<'src>>, WithPos<ParseError>> {
         let tok = self.next()?;
         if tok.val != kind {
             return Err(ParseError::unexpected_(tok, format!("{:?}", kind)));
@@ -369,7 +367,7 @@ impl<'src> Parser<'src> {
         Ok(tok)
     }
 
-    pub fn parse(mut self) -> Result<Table<'src>, WithPos<ParseError<'src>>> {
+    pub fn parse(mut self) -> Result<Table<'src>, WithPos<ParseError>> {
         let mut root: Table<'src> = Table(vec![]);
         // let mut sections: Vec<(String, Table<'src>, Pos)> = vec![];
         let mut current_table: Option<usize> = None;
@@ -400,7 +398,7 @@ impl<'src> Parser<'src> {
         Ok(root)
     }
 
-    fn parse_section_header(&mut self) -> Result<(WithPos<&'src str>, Pos), WithPos<ParseError<'src>>> {
+    fn parse_section_header(&mut self) -> Result<(WithPos<&'src str>, Pos), WithPos<ParseError>> {
         let start = self.expect(Token::LBracket)?.pos.span.start;
         let name = self.next()?;
         let name = name.map(|tok| match tok {
@@ -415,7 +413,7 @@ impl<'src> Parser<'src> {
         Ok((name, bigpos))
     }
 
-    fn parse_key_value(&mut self) -> Result<Entry<'src>, WithPos<ParseError<'src>>> {
+    fn parse_key_value(&mut self) -> Result<Entry<'src>, WithPos<ParseError>> {
         let key = self.next()?;
         let key = key.map(|tok| match tok {
             Token::Identifier(s) => Ok(s),
@@ -429,7 +427,7 @@ impl<'src> Parser<'src> {
         Ok(Entry { key, val })
     }
 
-    fn parse_value(&mut self) -> Result<WithPos<Value<'src>>, WithPos<ParseError<'src>>> {
+    fn parse_value(&mut self) -> Result<WithPos<Value<'src>>, WithPos<ParseError>> {
         let peek = self.peek()?;
         match peek.val {
             Token::String(s)  => { self.next()?; Ok(WithPos { pos: peek.pos, val: Value::String(s) }) }
@@ -441,7 +439,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_array(&mut self) -> Result<WithPos<Value<'src>>, WithPos<ParseError<'src>>> {
+    fn parse_array(&mut self) -> Result<WithPos<Value<'src>>, WithPos<ParseError>> {
         let mut pos = self.expect(Token::LBracket)?.pos;
         let mut elements = vec![];
 
@@ -466,10 +464,10 @@ impl<'src> Parser<'src> {
         };
 
         pos.span.end = end.span.end;
-        Ok((WithPos { val: Value::Array(elements), pos }))
+        Ok(WithPos { val: Value::Array(elements), pos })
     }
 
-    fn parse_inline_table(&mut self) -> Result<WithPos<Value<'src>>, WithPos<ParseError<'src>>> {
+    fn parse_inline_table(&mut self) -> Result<WithPos<Value<'src>>, WithPos<ParseError>> {
         let mut pos = self.expect(Token::LBrace)?.pos;
         let mut table = vec![];
 
@@ -507,7 +505,7 @@ impl<'src> Parser<'src> {
 #[derive(Debug)]
 pub enum RetrieveError<'src> {
     FieldNotFound(&'src str), // key
-    IncompatibleType(&'src str, &'static str, &'static str), // key, expected, found
+    IncompatibleType(&'static str, &'static str), // key, expected, found
 }
 
 impl<'src> Table<'src> {
@@ -534,7 +532,7 @@ impl<'src> Table<'src> {
         };
 
         entry.val.val.extract::<T>().map_err(move |e|
-            WithPos { pos: entry.val.pos, val: RetrieveError::IncompatibleType(key, e.expected, e.found) }
+            WithPos { pos: entry.val.pos, val: RetrieveError::IncompatibleType(e.expected, e.found) }
         ).map(|val| WithPos {pos: entry.val.pos, val })
     }
 

@@ -1,5 +1,5 @@
-use crate::parser::{toml, Pos, WithPos, Span, lineview, message_with_evidence};
-use crate::base::{Align, AppPath, AutoSize, log_report, is_version_compatible, MYTHIC_VERSION};
+use crate::parser::{toml, Pos, WithPos, Span};
+use crate::base::{Align, AppPath, AutoSize, log_user, app_paths, is_version_compatible, bounded_optimal_string_alignment_distance};
 use crate::sprites::SpriteController;
 use crate::sensing::Sensors;
 use crate::sprites::clip::ClipBank;
@@ -10,16 +10,16 @@ use std::path::Path;
 use crate::worker::watcher::{WindowUpdate, WindowUpdateKind};
 
 #[derive(Debug)]
-pub enum SpriteDeclLoadReportKind<'src> {
+pub enum SpriteDeclLoadReportKind {
     IOError(std::io::Error),
-    TomlParseError(toml::ParseError<'src>),
+    TomlParseError(toml::ParseError),
 
     VersionMissing,
     VersionNotString,
     VersionUnrecognizable,
     VersionNotCompatible,
 
-    Retrieve(toml::RetrieveError<'src>),
+    Retrieve(toml::RetrieveError<'static>),
     NoHorizontalPosition,
     NoVerticalPosition,
     SpritePathEmtpy,
@@ -31,48 +31,75 @@ pub enum SpriteDeclLoadReportKind<'src> {
     MultipleTomlInPath,
     NoTomlInPath,
     NoSuchPath,
-    LoadError,
+    LoadIoError(Option<std::io::Error>),
     UnrecognizedEntry,
 
     NeedBothSize,
 }
 
-impl<'key> From<WithPos<toml::RetrieveError<'key>>> for WithPos<SpriteDeclLoadReportKind<'key>> {
-    fn from(value: WithPos<toml::RetrieveError<'key>>) -> Self {
+impl From<WithPos<toml::RetrieveError<'static>>> for WithPos<SpriteDeclLoadReportKind> {
+    fn from(value: WithPos<toml::RetrieveError<'static>>) -> Self {
         value.map(SpriteDeclLoadReportKind::Retrieve)
     }
 }
 
-struct SpriteDeclLoadReport<'src> {
-    file: &'src AppPath,
-    src: &'src str, // must refer to the whole file
-    pos: Pos, // must refer to file-level offsets
-    kind: SpriteDeclLoadReportKind<'src>,
+pub struct SpriteDeclLoadReport<'src> {
+    pub file: &'src AppPath,
+    pub src: &'src str, // must refer to the whole file
+    pub pos: Pos, // must refer to file-level offsets
+    pub kind: SpriteDeclLoadReportKind,
 }
 
+
+#[derive(Debug)]
+pub struct ParamEntry {
+    pub key: String,
+    pub val: String,
+    pub lineno: usize,
+}
+
+impl PartialEq for ParamEntry {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.key, &self.val) == (&other.key, &other.val)
+    }
+}
+impl Eq for ParamEntry {}
 
 // keys in 'inner' are always in certain order, we can simply compare them for equality without lookups
 #[derive(Debug, PartialEq, Eq)]
 pub struct Params {
     // always sorted in reverse of lexical order of the parameter keys
-    inner: Vec<(String, String)>,
+    inner: Vec<ParamEntry>,
 }
 
 impl<'src> Params {
-    pub fn new(mut pairs: Vec<(String, String)>) -> Self {
+    pub fn new(mut raw: Vec<ParamEntry>) -> Self {
         // stable sort using param keys to collect duplicated keys in appearing order
-        pairs.sort_by(|kv1, kv2| kv1.0.cmp(&kv2.0));
-        pairs.reverse(); // dedup leaves first of the consecutives, we want the last.
-        pairs.dedup_by(|kv1,kv2| kv1.0 == kv2.0);
-        Self { inner: pairs }
+        raw.sort_by(|ent1, ent2| ent1.key.cmp(&ent2.key));
+        raw.reverse(); // dedup leaves first of the consecutives, we want the last.
+        raw.dedup_by(|ent1,ent2| ent1.key == ent2.key);
+        Self { inner: raw }
     }
 
     pub fn lookup(&self, name: &str) -> Option<&str> {
-        self.inner.iter().rfind(|x| x.0 == name).map(|x| x.1.as_str())
+        self.inner.iter().rfind(|ent| ent.key == name).map(|ent| ent.val.as_str())
     }
 
-    pub fn set(&mut self, name: &'src str, val: &'src str) {
-        self.inner.push((name.into(), val.into()))
+    pub fn find_fuzzy_match(&self, needle: &str) -> Option<&ParamEntry> {
+        let max_dist = if needle.len() < 5 {
+            needle.len() / 2
+        } else {
+            needle.len() / 4
+        };
+
+        let mut buffer = vec![0; 3*(needle.len()+1)];
+
+        let idx = self.inner.iter().enumerate().filter_map(|(i, hay)|
+            bounded_optimal_string_alignment_distance(&hay.key, needle, max_dist, &mut buffer[..])
+            .map(|d| (d, i))
+        ).min().map(|(_, i)| i);
+
+        idx.map(|i| &self.inner[i])
     }
 }
 
@@ -88,109 +115,6 @@ pub struct SpriteDecl {
     sprite: Option<SpriteController>,
 }
 
-impl<'src> std::fmt::Display for SpriteDeclLoadReport<'src> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use log::Level::*;
-        let file = self.file.as_rel().to_string_lossy();
-        let file = file.as_ref();
-        let (buf, span) = lineview(self.src, self.pos.span);
-        let span = Some(span);
-
-        use SpriteDeclLoadReportKind::*;
-
-        match &self.kind {
-            IOError(e) =>
-                message_with_evidence(f, Error, file, 0, buf, None, |f|
-                    write!(f, "could not read; {e}")
-                ),
-
-            TomlParseError(parse_error) => {
-                parse_error.message_with_evidence(f, file, self.pos.line, buf, span)
-            }
-
-            Retrieve(retrieve_error) => match retrieve_error {
-                toml::RetrieveError::FieldNotFound(field_name) =>
-                    message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                        write!(f, "required field '{field_name}' is missing")
-                    ),
-                toml::RetrieveError::IncompatibleType(field_name, expected, found) =>
-                    message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                        write!(f, "required field '{field_name}' should be '{expected}' but found '{found}'")
-                    ),
-            }
-
-            VersionMissing =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "mythic_version is missing")
-                ),
-            VersionNotString =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "mythic version is not a string")
-                ),
-            VersionUnrecognizable =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "mythic version is unrecognizable")
-                ),
-            VersionNotCompatible =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "mythic version is not compatible with current version {}.{}", MYTHIC_VERSION.major, MYTHIC_VERSION.minor)
-                ),
-            NoHorizontalPosition =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "horizontal position is missing, one of pos.left, pos.xcenter, pos.right should be present")
-                ),
-            NoVerticalPosition =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "vertical position is missing, one of pos.top, pos.ycenter, pos.bottom should be present")
-                ),
-            SpritePathEmtpy =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "sprite path is epmty")
-                ),
-            SpritePatyAbsolute =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                    write!(f, "sprite path should be relative to the containing file's path")
-                ),
-            UnrecognizedField =>
-                message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                    write!(f, "unrecognized field")
-                ),
-            CannotHandlePath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None, |f|
-                    write!(f, "sprite path must refer to a toml file or a directory containing one")
-                ),
-            CannotReadDir =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None, |f|
-                    write!(f, "sprite path refers to a directory but cannot read it")
-                ),
-            MultipleTomlInPath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None, |f|
-                    write!(f, "sprite path refers to a directory but there are many toml files to select from")
-                ),
-            NoTomlInPath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None, |f|
-                    write!(f, "sprite path refers to a directory but there is no toml file to select")
-                ),
-            NoSuchPath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None, |f|
-                    write!(f, "sprite path refers to nothing in the file system")
-                ),
-            LoadError =>
-                message_with_evidence(f, Error, file, self.pos.line, "", None, |f|
-                    write!(f, "could not load sprite toml file due to the previous error(s), skipping it")
-                ),
-            UnrecognizedEntry =>
-                message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                    write!(f, "unrecognized global field found, ignoring it")
-                ),
-
-            NeedBothSize =>
-                message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                    write!(f, "need both with and height be specified")
-                ),
-        }
-    }
-}
 
 impl SpriteDecl {
     pub fn get_sprite(&self) -> Option<&SpriteController> {
@@ -205,10 +129,10 @@ impl SpriteDecl {
 
     /// Note that this function will consume the fields from the section if it recognizes them
     /// It will ease the caller to handle the unrecognized fields
-    fn from_toml<'src>(name: &str, section: WithPos<&mut toml::Table<'src>>) -> Result<SpriteDecl, WithPos<SpriteDeclLoadReportKind<'src>>> {
-        fn extract<'v, 'src, T: toml::ExtractValue<'src>>(entry: &'v toml::Entry<'src>) -> Result<&'v T, WithPos<toml::RetrieveError<'src>>> {
+    fn from_toml<'src>(name: &str, section: WithPos<&mut toml::Table<'src>>) -> Result<SpriteDecl, WithPos<SpriteDeclLoadReportKind>> {
+        fn extract<'v, 'src, T: toml::ExtractValue<'src>>(entry: &'v toml::Entry<'src>) -> Result<&'v T, WithPos<toml::RetrieveError<'static>>> {
             entry.val.val.extract::<T>().map_err(|e| {
-                entry.val.pos.with(toml::RetrieveError::IncompatibleType(entry.key.val, e.expected, e.found))
+                entry.val.pos.with(toml::RetrieveError::IncompatibleType(e.expected, e.found))
             })
         }
 
@@ -229,7 +153,7 @@ impl SpriteDecl {
                 return Err(entry.val.pos.with(SpriteDeclLoadReportKind::SpritePatyAbsolute));
             }
 
-            crate::base::path().sprite(path)
+            app_paths().sprite(path)
         };
 
 
@@ -276,8 +200,12 @@ impl SpriteDecl {
             (xpos, ypos)
         };
 
-        let mut params  = section.pop_all_with_prefix("param.").map(|entry| -> Result<(String, String), WithPos<SpriteDeclLoadReportKind<'src>>> {
-            Ok((entry.key.val.strip_prefix("param.").unwrap().to_string(), extract::<&str>(&entry)?.to_string())) // TODO support other value types
+        let params = section.pop_all_with_prefix("param.").map(|entry| -> Result<ParamEntry, WithPos<SpriteDeclLoadReportKind>> {
+            Ok(ParamEntry {
+                lineno: entry.key.pos.line,
+                key: entry.key.val.strip_prefix("param.").unwrap().to_string(),
+                val: extract::<&str>(&entry)?.to_string(),
+            }) // TODO support other value types
         }).collect::<Result<Vec<_>, _>>()?;
         let params = Params::new(params);
 
@@ -289,7 +217,7 @@ impl SpriteDecl {
     // if no sprite.toml, but only one toml, use it.
     // otherwise error.
     // clips are searched relatively to the sprite.toml file.
-    fn load_sprite(&mut self, sensors: &mut Sensors, clipbank: &mut ClipBank) -> Result<Option<SpriteController>, SpriteDeclLoadReportKind<'static>> {
+    fn load_sprite(&mut self, sensors: &mut Sensors, clipbank: &mut ClipBank) -> Result<Option<SpriteController>, SpriteDeclLoadReportKind> {
         let filepath = if ! self.path.exists() {
             // path does not exist
             return Err(SpriteDeclLoadReportKind::NoSuchPath);
@@ -327,8 +255,9 @@ impl SpriteDecl {
             return Err(SpriteDeclLoadReportKind::CannotHandlePath);
         };
 
-        let sprite = SpriteController::load(&filepath, self.size, sensors, clipbank, &self.params);
-        Ok(self.sprite.replace(sprite.ok_or(SpriteDeclLoadReportKind::LoadError)?))
+        let sprite = SpriteController::load(&filepath, self.size, sensors, clipbank, &self.params)
+            .map_err(SpriteDeclLoadReportKind::LoadIoError)?;
+        Ok(self.sprite.replace(sprite))
     }
 
     pub fn unload_sprite(&mut self, sensors: &mut Sensors, clipbank: &mut ClipBank) {
@@ -359,58 +288,52 @@ impl Sprites {
         Self { next_id: 0, decls: HashMap::new() }
     }
 
-    fn load_decls(file: &AppPath) -> (Self, String) {
-        if ! file.exists() { return (Self::new(), String::new()) }
+    fn load_decls(path: &AppPath) -> (Self, String) {
+        if ! path.exists() { return (Self::new(), String::new()) }
 
-        let src_string = match std::fs::read_to_string(file) {
+        let src_string = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
-                log_report(SpriteDeclLoadReport {
-                    file, src: "", pos: Pos::nil(), kind: SpriteDeclLoadReportKind::IOError(e),
+                log_user!("{}", SpriteDeclLoadReport {
+                    file: path, src: "", pos: Pos::nil(), kind: SpriteDeclLoadReportKind::IOError(e),
                 });
                 return (Self::new(), String::new());
             }
         };
         let src = src_string.as_str();
 
+        let report_error = |e: WithPos<SpriteDeclLoadReportKind>| {
+            log_user!("{}", SpriteDeclLoadReport { file: path, src, pos: e.pos, kind: e.val });
+        };
+
         let mut toml = match toml::Parser::new(src).parse() {
             Ok(toml) => toml,
             Err(e) => {
-                log_report(SpriteDeclLoadReport {
-                    file, src, pos: e.pos, kind: SpriteDeclLoadReportKind::TomlParseError(e.val),
-                });
+                report_error(e.pos.with(SpriteDeclLoadReportKind::TomlParseError(e.val)));
                 return (Self::new(), src_string);
             }
         };
 
         { // version
             let Some(version) = toml.pop("version") else {
-                log_report(SpriteDeclLoadReport {
-                    file, src, pos: Pos::nil(), kind: SpriteDeclLoadReportKind::VersionMissing,
-                });
+                report_error(Pos::nil().with(SpriteDeclLoadReportKind::VersionMissing));
                 return (Self::new(), src_string);
             };
 
             let pos = version.val.pos;
 
             let toml::Value::String(version) = version.val.val else {
-                log_report(SpriteDeclLoadReport {
-                    file, src, pos, kind: SpriteDeclLoadReportKind::VersionNotString,
-                });
+                report_error(pos.with(SpriteDeclLoadReportKind::VersionNotString));
                 return (Self::new(), src_string);
             };
 
             let Some(compat) = is_version_compatible(version) else {
-                log_report(SpriteDeclLoadReport {
-                    file, src, pos, kind: SpriteDeclLoadReportKind::VersionUnrecognizable,
-                });
+                report_error(pos.with(SpriteDeclLoadReportKind::VersionUnrecognizable));
                 return (Self::new(), src_string);
             };
 
             if ! compat {
-                log_report(SpriteDeclLoadReport {
-                    file, src, pos, kind: SpriteDeclLoadReportKind::VersionNotCompatible,
-                });
+                report_error(pos.with(SpriteDeclLoadReportKind::VersionNotCompatible));
                 return (Self::new(), src_string);
             }
         }
@@ -420,9 +343,7 @@ impl Sprites {
             let section = match section_entry.val.val.extract_mut::<toml::Table>() {
                 Ok(section) => section,
                 Err(_e) => {
-                    log_report(SpriteDeclLoadReport {
-                        file, src, pos: section_entry.key.pos, kind: SpriteDeclLoadReportKind::UnrecognizedEntry,
-                    });
+                    report_error(section_entry.key.pos.with(SpriteDeclLoadReportKind::UnrecognizedEntry));
                     continue;
                 }
             };
@@ -431,17 +352,13 @@ impl Sprites {
             let decl = match SpriteDecl::from_toml(name, WithPos { pos: section_entry.val.pos, val: section }) {
                 Ok(decl) => decl,
                 Err(e) => {
-                    log_report(SpriteDeclLoadReport {
-                        file, src, pos: e.pos, kind: e.val,
-                    });
+                    report_error(e);
                     continue;
                 }
             };
 
             for entry in &section.0 {
-                log_report(SpriteDeclLoadReport {
-                    file, src, pos: entry.key.pos, kind: SpriteDeclLoadReportKind::UnrecognizedField
-                });
+                report_error(entry.key.pos.with(SpriteDeclLoadReportKind::UnrecognizedField));
             }
 
             decls.push(decl, section_entry.val.pos.line);
@@ -475,7 +392,7 @@ impl Sprites {
                     scon.unload(sensors, clipbank);
                 }
                 Err(e) => {
-                    log_report(SpriteDeclLoadReport {
+                    log_user!("{}", SpriteDeclLoadReport {
                         file, src: "", pos: Pos { line: *lineno, column: 0, span: Span::nil() },  kind: e,
                     });
                 }
@@ -600,7 +517,7 @@ impl Sprites {
                         scon.unload(sensors, clipbank);
                     }
                     Err(e) => {
-                        log_report(SpriteDeclLoadReport {
+                        log_user!("{}", SpriteDeclLoadReport {
                             file, src: "", pos: Pos { line: *cur_decl_line, column: 0, span: Span::nil() }, kind: e,
                         });
                     }
@@ -637,7 +554,7 @@ impl Sprites {
                 Ok(Some(_)) => unreachable!(),
                 Ok(None) => true,
                 Err(e) => {
-                    log_report(SpriteDeclLoadReport {
+                    log_user!("{}", SpriteDeclLoadReport {
                         file, src: "", pos: Pos { line: lineno, column: 0, span: Span::nil() }, kind: e,
                     });
                     false
@@ -651,7 +568,7 @@ impl Sprites {
     }
 
     pub fn reload_sprite(&mut self, sprite_path: &AppPath, sensors: &mut Sensors, clipbank: &mut ClipBank, mut report: impl FnMut(WindowUpdate)) {
-        let file = crate::base::path().sprite_list();
+        let file = app_paths().sprite_list();
         let file = &file;
         let containing_path = sprite_path.parent().unwrap();
 
@@ -675,7 +592,7 @@ impl Sprites {
                     report(WindowUpdate { spriteid, kind: WindowUpdateKind::Create });
                 }
                 Err(e) => {
-                    log_report(SpriteDeclLoadReport {
+                    log_user!("{}", SpriteDeclLoadReport {
                         file, src: "", pos: Pos { line: *lineno, column: 0, span: Span::nil() }, kind: e,
                     });
                 }

@@ -6,12 +6,13 @@ pub use windows as sys;
 pub use sys::BuiltinSensor;
 
 
+
 #[cfg(debug_assertions)]
 pub mod debug {
     // read sensing values from a file
 
     use crate::parser::{self, toml, WithPos, lineview};
-    use crate::base::write_report;
+    use crate::base::{app_paths, WriterWrapper};
 
     use std::fs;
 
@@ -26,7 +27,7 @@ pub mod debug {
         pub fn nil() -> Self { Self { decls: vec![], data: vec![] } }
 
         pub fn create() -> Self {
-            let path = crate::base::path().plugin("debug.toml");
+            let path = app_paths().plugin("debug.toml");
 
             let Ok(src) = fs::read_to_string(&path) else {
                 log::info!("debug sensor file not found at '{path}'");
@@ -37,9 +38,9 @@ pub mod debug {
                 Ok(tbl) => tbl,
                 Err(WithPos{ pos, val }) => {
                     let (buf, span) = lineview(&src, pos.span);
-                    write_report(|f| val.message_with_evidence(
+                    log::debug!("{}", WriterWrapper(|f: &mut std::fmt::Formatter| val.message_with_evidence(
                         f, &path.as_rel().to_string_lossy(), pos.line, buf, Some(span)
-                    ));
+                    )));
                     return Self::nil();
                 }
             };
@@ -65,13 +66,10 @@ pub mod debug {
             // TODO report error
             if self.decls.is_empty() { return; }
 
-            let path = crate::base::path().plugin("debug.toml");
+            let path = app_paths().plugin("debug.toml");
 
             let Ok(src) = fs::read_to_string(&path) else {
-                write_report(|f|
-                    write!(f, "debug sensor file could not be read at '{path}'")
-                );
-
+                log::error!("debug sensor file could not be read at '{path}'");
                 return;
             };
 
@@ -79,9 +77,9 @@ pub mod debug {
                 Ok(tbl) => tbl,
                 Err(WithPos{ pos, val }) => {
                     let (buf, span) = lineview(&src, pos.span);
-                    write_report(|f| val.message_with_evidence(
+                    log::debug!("{}", WriterWrapper(|f: &mut std::fmt::Formatter| val.message_with_evidence(
                         f, &path.as_rel().to_string_lossy(), pos.line, buf, Some(span)
-                    ));
+                    )));
                     return;
                 }
             };
@@ -99,17 +97,17 @@ pub mod debug {
                     // TODO remove _fieldname field?, the caller would know the field name with
                     Err(WithPos { pos, val: toml::RetrieveError::FieldNotFound(_fieldname) }) => {
                         let (buf, span) = lineview(&src, pos.span);
-                        write_report(|f| parser::message_with_evidence(
-                            f, log::Level::Error, &path.as_rel().to_string_lossy(), pos.line, buf, Some(span), |f|
-                            write!(f, "debug sensor '{name}' has not been found, keeping the last value")
-                        ));
+                        log::debug!("{}", WriterWrapper(|f: &mut std::fmt::Formatter| parser::message_with_evidence(
+                            f, log::Level::Error, &path.as_rel().to_string_lossy(), pos.line, buf, Some(span),
+                            format_args!("debug sensor '{name}' has not been found, keeping the last value")
+                        )));
                     }
-                    Err(WithPos { pos, val: toml::RetrieveError::IncompatibleType(_fieldname, expected, found) }) => {
+                    Err(WithPos { pos, val: toml::RetrieveError::IncompatibleType(expected, found) }) => {
                         let (buf, span) = lineview(&src, pos.span);
-                        write_report(|f| parser::message_with_evidence(
-                            f, log::Level::Error, &path.as_rel().to_string_lossy(), pos.line, buf, Some(span), |f|
-                            write!(f, "debug sensor '{name}' has {} type but given {}, ignoring new value", expected, found)
-                        ));
+                        log::debug!("{}", WriterWrapper(|f: &mut std::fmt::Formatter| parser::message_with_evidence(
+                            f, log::Level::Error, &path.as_rel().to_string_lossy(), pos.line, buf, Some(span),
+                            format_args!("debug sensor '{name}' has {} type but given {}, ignoring new value", expected, found)
+                        )));
                     }
                 }
             }

@@ -589,16 +589,16 @@ impl std::fmt::Display for Type {
 
 #[derive(Debug)]
 pub enum SemanticError {
-    UnknownParam(String),
-    UnknownIdentifier(String),
+    UnknownParam,
+    UnknownIdentifier,
     TypeMismatch {
         expected: Type,
         found: Type,
     },
 }
 
-pub fn semantic_pass(
-    src: &str,
+pub fn semantic_pass<'src>(
+    src: &'src str,
     arena_expr: &mut Arena<Expr>,
     arena_span: &Arena<Span>,
     id: ExprId,
@@ -626,7 +626,7 @@ pub fn semantic_pass(
         Ident(span) => {
             let path = &src[span.start..span.end];
             let (ty, rid) = resolver.resolve_type(path)
-                .map_err(|e| WithSpan { span, val: e })?;
+                .map_err(|e| e.unframe(span))?;
                 update = Some(Sensing(rid));
             Ok(ty)
         }

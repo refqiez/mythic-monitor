@@ -1,6 +1,6 @@
-use crate::base::{AutoSize, AppPath, log_report, is_version_compatible, MYTHIC_VERSION};
-use crate::parser::{expr, toml, Pos, WithSpan, WithPos, message_with_evidence, lineview};
-use crate::sensing::{Sensors, SensingId};
+use crate::base::{AutoSize, AppPath, log_user, is_version_compatible};
+use crate::parser::{expr, toml, Pos, Span, WithSpan, WithPos};
+use crate::sensing::{Sensors, SensingId, OpaqueError};
 use super::clip::{self, Clip, ClipId, ClipBank};
 use super::decls::Params;
 
@@ -9,23 +9,36 @@ use std::path::Path;
 /// Resolver
 
 pub trait TypeResolver {
-    fn resolve_type(&mut self, path: &str) -> Result<(expr::Type, SensingId), expr::SemanticError>;
+    fn resolve_type(&mut self, path: &str) -> Result<(expr::Type, SensingId), WithSpan<expr::SemanticError>>;
 }
 
 pub trait ValueResolver {
     fn resolve_value(&self, sid: SensingId) -> expr::Value;
 }
 
+pub struct UnknownIdentErr<'a> {
+    pub realpath: String,
+    pub plugin: &'a str,
+    pub opaque: OpaqueError<'a>,
+}
+
 // wrapper to enable 'rollback' of registerations when error occurs
 struct SensorsWrapper<'a> {
-    inner: &'a mut Sensors,
+    // If we use *mut Sensors here, it will prevent us from storing errors in the same struct.
+    // self.inner will always have lifetime of 'self so that self.inner.register returns OpaqueError<'self>
+    // which conflicts with the definition.
+    // This is safe since SensorsWrapper::new requires &'a mut Sensors and SensorsWrapper<'a> is forced to
+    // be dropped before Sensors. The same goes for self.error.
+    inner: std::ptr::NonNull<Sensors>,
     params: &'a Params,
     registered: Vec<SensingId>,
+    // to hold last opaque error during resolve_type, since we don't want to give it to Expr
+    error: Option<UnknownIdentErr<'a>>, // realpath, plugin, opaque
 }
 
 impl<'a> SensorsWrapper<'a> {
     pub fn new(inner: &'a mut Sensors, params: &'a Params) -> Self {
-        Self { inner, params, registered: vec![] }
+        Self { inner: std::ptr::NonNull::from_mut(inner), params, registered: vec![], error: None }
     }
 
     pub fn commit(mut self) {
@@ -37,34 +50,27 @@ impl Drop for SensorsWrapper<'_> {
     fn drop(&mut self) {
         // automatic rollback unless committed
         for sid in &self.registered {
-            self.inner.unregister(*sid);
+            unsafe { self.inner.as_mut().unregister(*sid); }
         }
     }
 }
 
-impl TypeResolver for SensorsWrapper<'_> {
-    fn resolve_type(&mut self, path: &str) -> Result<(expr::Type, SensingId), expr::SemanticError> {
-        let path = path.split('.').map(|ident| {
+impl<'a> TypeResolver for SensorsWrapper<'a> {
+    fn resolve_type(&mut self, path: &str) -> Result<(expr::Type, SensingId), WithSpan<expr::SemanticError>> {
+        let realpath = Span::split(path, '.').map(|span| {
+            let ident = &path[span.start..span.end];
             let Some(param) = path.strip_prefix('$') else { return Ok(ident) };
-            self.params.lookup(param).ok_or(expr::SemanticError::UnknownParam(ident.to_string()))
+            self.params.lookup(param).ok_or(span.with(expr::SemanticError::UnknownParam))
         }).collect::<Result<String, _>>()?;
 
-        match self.inner.register(&path) {
+        match unsafe { self.inner.as_mut().register(&realpath) } {
             Ok((t, sid)) => {
                 self.registered.push(sid);
                 Ok((t, sid))
             }
-            Err((name, opaque)) => {
-                // FIXME reuse report_opaque_error from poller?
-                use crate::sensing::OpaqueErrorMsgFail;
-                let message = match opaque.message {
-                    Ok(s) => format!("[{name}] {s}"),
-                    Err(OpaqueErrorMsgFail::Error(e)) => format!("[{name}] <ERR {e}; {}>", opaque.errcode),
-                    Err(OpaqueErrorMsgFail::Null) => format!("[{name}] <NULL; {}>", opaque.errcode),
-                    Err(OpaqueErrorMsgFail::NotUtf8(s)) =>
-                        format!("[{name}] {s}{}..<UTF8 ERR; {}>", char::REPLACEMENT_CHARACTER, opaque.errcode),
-                };
-                Err(expr::SemanticError::UnknownIdentifier(message))
+            Err((plugin, opaque)) => {
+                self.error = Some(UnknownIdentErr { realpath, plugin, opaque });
+                Err(Span::whole(path).with(expr::SemanticError::UnknownIdentifier))
             }
         }
     }
@@ -100,26 +106,30 @@ impl std::fmt::Debug for ConditionExpr {
     }
 }
 
-enum ConditionError {
+pub enum ConditionSemanticError<'a> {
+    UnknownParam(&'a Params),
+    UnknownIdentifier(UnknownIdentErr<'a>),
+    TypeMismatch {
+        expected: expr::Type,
+        found: expr::Type,
+    },
+}
+
+pub enum ConditionError<'a> {
     SyntaxError(expr::ParseError),
-    SemanticError(expr::SemanticError),
+    SemanticError(ConditionSemanticError<'a>),
     RetType(expr::Type),
 }
 
-impl From<WithSpan<expr::ParseError>> for WithSpan<ConditionError> {
+impl<'a> From<WithSpan<expr::ParseError>> for WithSpan<ConditionError<'a>> {
     fn from(value: WithSpan<expr::ParseError>) -> Self {
         value.map(ConditionError::SyntaxError)
     }
 }
 
-impl From<WithSpan<expr::SemanticError>> for WithSpan<ConditionError> {
-    fn from(value: WithSpan<expr::SemanticError>) -> Self {
-        value.map(ConditionError::SemanticError)
-    }
-}
 
 impl ConditionExpr {
-    pub fn load(src: &str, sensors: &mut Sensors, params: &Params) -> Result<Self, WithSpan<ConditionError>> {
+    pub fn load<'a>(src: &str, sensors: &'a mut Sensors, params: &'a Params) -> Result<Self, WithSpan<ConditionError<'a>>> {
         let (mut arena_expr, arena_span, expr) = expr::Parser::new(src).parse()?;
 
         let Some(expr) = expr else {
@@ -128,9 +138,16 @@ impl ConditionExpr {
 
         let mut sw = SensorsWrapper::new(sensors, params);
 
-        let ty = expr::semantic_pass(src, &mut arena_expr, &arena_span, expr, &mut sw)?;
+        let ty: expr::Type = expr::semantic_pass(src, &mut arena_expr, &arena_span, expr, &mut sw)
+            .map_err(|e| e.map(|kind| match kind {
+                expr::SemanticError::UnknownParam => ConditionSemanticError::UnknownParam(params),
+                expr::SemanticError::UnknownIdentifier => ConditionSemanticError::UnknownIdentifier(sw.error.take().unwrap()),
+                expr::SemanticError::TypeMismatch { expected, found } =>
+                    ConditionSemanticError::TypeMismatch { expected, found },
+            }).map(ConditionError::SemanticError))?;
 
         if ty != expr::Type::Bool {
+            // SensorsWrapper will roll back registerations automatically
             return Err(WithSpan::nil(ConditionError::RetType(ty)));
         }
 
@@ -144,14 +161,7 @@ impl ConditionExpr {
         expr::unregister(&inner.arena, inner.root, &mut |sid|
             // FIXME report errors up?
             if let Err((name, e)) = sensors.unregister(sid) {
-                use crate::sensing::OpaqueErrorMsgFail;
-                let message = match e.message {
-                    Ok(s) => format!("[{name}] {s} while unloading"),
-                    Err(OpaqueErrorMsgFail::Error(e)) => format!("[{name}] <ERR {e}> while unloading"),
-                    Err(OpaqueErrorMsgFail::Null) => format!("[{name}] <NULL>while unloading"),
-                    Err(OpaqueErrorMsgFail::NotUtf8(s)) =>
-                        format!("[{name}] {s}{}..<UTF8 ERR> while unloading", char::REPLACEMENT_CHARACTER),
-                };
+                crate::worker::report_opaque_error(name, "unregister", e);
             }
         );
     }
@@ -168,7 +178,7 @@ impl ConditionExpr {
 
 /// Controller
 
-enum SpriteSchemaError<'a> {
+pub enum SpriteSchemaError {
     VersionMissing,
     VersionNotString,
     VersionUnrecognizable,
@@ -187,195 +197,35 @@ enum SpriteSchemaError<'a> {
     ClipPathNotString,
     ClipValueEmpty,
     ClipValueAbsolute,
-    NoAvailableClip(&'a str), // state name
+    NoAvailableClip,
 }
 
-enum ControllerLoadReportKind<'src> {
+pub enum ControllerLoadReportKind<'a> {
     ClipLoadError(clip::ClipLoadError),
-    ConditionError(ConditionError),
-    TomlParseError(toml::ParseError<'src>),
-    SchemaError(SpriteSchemaError<'src>),
+    TransConditionError(ConditionError<'a>),
+    TomlParseError(toml::ParseError),
+    SchemaError(SpriteSchemaError),
 }
 
-struct ControllerLoadReport<'src> {
-    file: &'src AppPath,
-    src: &'src str, // must refer to the whole file
-    pos: Pos, // must refer to file-level offsets
-    kind: ControllerLoadReportKind<'src>,
+pub struct ControllerLoadReport<'src, 'a> {
+    pub file: &'src AppPath,
+    pub src: &'src str, // must refer to the whole file
+    pub pos: Pos, // must refer to file-level offsets
+    pub kind: ControllerLoadReportKind<'a>,
 }
 
-impl<'src> ControllerLoadReport<'src> {
-    /// expr module's errors are reported with Pos's that are framed with the string value.
+impl<'a> ControllerLoadReportKind<'a> {
+    /// expr module's errors are reported with Pos's that are framed within the string value.
     /// This will translate the Pos to file-level.
-    fn from_cond(file: &'src AppPath, src: &'src str, expr_pos: Pos, cond_e: WithSpan<ConditionError>) -> Self {
+    fn from_cond(expr_pos: Pos, cond_e: WithSpan<ConditionError<'a>>) -> WithPos<Self> {
         let pos = Pos {
             span: cond_e.span + expr_pos.span.start + 1, // +1 for leading double quote
             ..expr_pos
         };
-        Self { file, src, pos, kind: ControllerLoadReportKind::ConditionError(cond_e.val) }
+        pos.with(ControllerLoadReportKind::TransConditionError(cond_e.val))
     }
 }
 
-use std::fmt::{Formatter, Display};
-type FmtRet = std::fmt::Result;
-
-impl<'src> Display for ControllerLoadReport<'src> {
-    fn fmt(&self, f: &mut Formatter) -> FmtRet {
-        use log::Level::*;
-        let (buf, span) = lineview(self.src, self.pos.span);
-        let span = Some(span);
-        let file=  self.file.as_rel().to_string_lossy();
-        let file = file.as_ref();
-
-        match &self.kind {
-            ControllerLoadReportKind::ClipLoadError(clipload_error) => {
-                use clip::ClipLoadError::*;
-                match clipload_error {
-                    CannotRead(e) =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "while loading clip file: {e}")
-                        ),
-                    WebPAnimDecoderNew | WebPAnimDecoderGetInfo | WebPAnimDecoderGetNext =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            // TODO use more elaborate error message
-                            write!(f, "while processing clip file: {clipload_error:?}")
-                        ),
-                }
-            }
-
-            ControllerLoadReportKind::ConditionError(cond_error) => {
-                use expr::LexError::*;
-                use expr::ParseError::*;
-                use expr::SemanticError::*;
-                use ConditionError::*;
-                match cond_error {
-                    SyntaxError(parse_error) => match &parse_error {
-                        UnexpectedToken { found, expected, } =>
-                            message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                                write!(f, "unexpected {}, expecting {}", found.repr(), expected)
-                            ),
-                        Unrecognized(lex_error) => {
-                            let msg = match lex_error {
-                                UnexpectedChar => "unexpected character",
-                                Newline => "newline found mid expression",
-                                InvalidLiteral => "invalid literal",
-                                NonAscii => "non ascii character",
-                                MalformedIdentifierPath => {
-                                    let s = &self.src[self.pos.span.start..self.pos.span.end];
-                                    if s.chars().last() == Some('.') {
-                                        "trailing period in identifier path"
-                                    } else {
-                                        "malformed identifier path"
-                                    }
-                                },
-                            };
-                            message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                                write!(f, "{}", msg)
-                            )
-                        }
-                    }
-
-                    SemanticError(semantic_error) => match semantic_error {
-                        UnknownParam(param) =>
-                            message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                                write!(f, "parameter '{param}' is not recognized")
-                                // TODO add Did you mean?
-                            ),
-                        UnknownIdentifier(message) =>
-                            message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                                write!(f, "identifier path is not recognized: {message}")
-                                // TODO add Did you mean?
-                            ),
-                        TypeMismatch { expected, found, } =>
-                            message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                                write!(f, "type mismatch. expected: {expected}, found: {found}")
-                            ),
-                    }
-                    RetType(ty) =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "condition expression must evaluate to boolean, found: {ty}")
-                        ),
-                }
-            }
-
-            ControllerLoadReportKind::TomlParseError(parse_error) => {
-                parse_error.message_with_evidence(f, file, self.pos.line, buf, span)
-            }
-
-            ControllerLoadReportKind::SchemaError(scheme_error) => {
-                use SpriteSchemaError::*;
-                match scheme_error {
-                    VersionMissing =>
-                        message_with_evidence(f, Error, file, 0, "", None, |f|
-                            write!(f, "mythic version is missing")
-                        ),
-                    VersionNotString =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "mythic version is not a string")
-                        ),
-                    VersionUnrecognizable =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "mythic version is unrecognizable")
-                        ),
-                    VersionNotCompatible =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "mythic version is not compatible with current version {}.{}", MYTHIC_VERSION.major, MYTHIC_VERSION.minor)
-                        ),
-                    UnrecognizedGlobalField =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "ignoring unrecognized global field")
-                        ),
-                    UnrecognizedField =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "ignoring unrecognized field")
-                        ),
-                    UnknownDestState =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "unknown transition destination, discarding the transition")
-                        ),
-                    NonStringCondition(type_str) =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "transition condition must be string but found {type_str}, using constant 'false' instead.")
-                        ),
-                    ClipWeightNotNumber(found) =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "clip weight must be a number but found {found}, using 0 instead")
-                        ),
-                    ClipWeightNegative =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "clip weight must be positive, using 0 instead")
-                        ),
-                    NotAllowedClipType =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "clip path value must be a string (relative path) or an inline table")
-                        ),
-                    ClipPathMissing =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "clip path is missing")
-                        ),
-                    ClipPathNotString =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "clip path should be a string")
-                        ),
-                    ClipValueEmpty =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "clip path string is empty")
-                        ),
-                    ClipValueAbsolute =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                            write!(f, "clip path must be relative to containing file's path")
-                        ),
-                    NoAvailableClip(state_name) =>
-                        // message_with_evidence(f, Warn, file, self.pos.line, buf, span, |f|
-                        //     write!(f, "state '{state_name}' hash no clips to select from, using empty clip")
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span, |f|
-                            write!(f, "state '{state_name}' hash no clips to select from, discarding sprite")
-                        ),
-                }
-            }
-        }
-    }
-}
 
 
 /// StateMachine
@@ -421,48 +271,57 @@ impl SpriteController {
     //   not loading clip yet
     //   separating load_state method
     // but untill we have persuading reason that surpasses the refactor cost, will just keep it
-    pub fn load(file: &AppPath, size: AutoSize, sensors: &mut Sensors, clipbank: &mut ClipBank, params: &Params) -> Option<Self> {
+    pub fn load(
+        path: &AppPath,
+        size: AutoSize,
+        sensors: &mut Sensors,
+        clipbank: &mut ClipBank,
+        params: &Params,
+    ) -> Result<Self, Option<std::io::Error>> {
         use ControllerLoadReportKind::*;
         use SpriteSchemaError::*;
 
-        let src = match std::fs::read_to_string(file) {
+        let src = match std::fs::read_to_string(path) {
             Ok(src) => src,
             Err(e) => {
-                log::error!("cannot read file '{file}': {e}");
-                return None;
+                return Err(Some(e));
             }
         };
         let src = src.as_str();
 
+        let report_error = |e: WithPos<ControllerLoadReportKind>| {
+            log_user!("{}", ControllerLoadReport { file: path, src, pos: e.pos, kind: e.val });
+        };
+
         let mut tbl = match toml::Parser::new(src).parse() {
             Ok(tbl) => tbl,
-            Err(WithPos{ pos, val }) => {
-                log_report(ControllerLoadReport { file, src, pos, kind: TomlParseError(val) });
-                return None;
+            Err(e) => {
+                report_error(e.map(TomlParseError));
+                return Err(None);
             }
         };
 
         { // version
             let Some(version) = tbl.pop("version") else {
-                log_report(ControllerLoadReport { file, src, pos: Pos::nil(), kind: SchemaError(VersionMissing) });
-                return None;
+                report_error(Pos::nil().with(SchemaError(VersionMissing)));
+                return Err(None);
             };
 
             let pos = version.val.pos;
 
             let toml::Value::String(version) = version.val.val else {
-                log_report(ControllerLoadReport { file, src, pos, kind: SchemaError(VersionNotString) });
-                return None;
+                report_error(pos.with(SchemaError(VersionNotString)));
+                return Err(None);
             };
 
             let Some(compat) = is_version_compatible(version) else {
-                log_report(ControllerLoadReport { file, src, pos, kind: SchemaError(VersionUnrecognizable) });
-                return None;
+                report_error(pos.with(SchemaError(VersionUnrecognizable)));
+                return Err(None);
             };
 
             if ! compat {
-                log_report(ControllerLoadReport { file, src, pos, kind: SchemaError(VersionNotCompatible) });
-                return None;
+                report_error(pos.with(SchemaError(VersionNotCompatible)));
+                return Err(None);
             }
         }
 
@@ -474,7 +333,7 @@ impl SpriteController {
                 match &entry.val.val {
                     toml::Value::Table(_v) => names.push(entry.key.val),
                     _ => {
-                        log_report(ControllerLoadReport { file, src, pos: entry.key.pos, kind: SchemaError(UnrecognizedGlobalField) });
+                        report_error(entry.key.pos.with(SchemaError(UnrecognizedGlobalField)));
                         continue;
                     }
                 }
@@ -489,20 +348,21 @@ impl SpriteController {
         let mut states = Vec::with_capacity(num_states);
         let state_slice = states.spare_capacity_mut();
 
+        let mut unknown_param_seen: Vec<&str> = vec![];
+        let mut unknown_ident_seen: Vec<&str> = vec![];
+
         for entry in tbl.0.into_iter() {
             let Some(state_id) = get_state_id(entry.key.val) else { continue };
             let toml::Value::Table(mut table) = entry.val.val else { unreachable!() };
 
-            fn validate_clip_path<'a>(path: WithPos<&'a str>, file: &AppPath, src: &str) -> Option<WithPos<&'a Path>> {
+            fn validate_clip_path<'a>(path: WithPos<&'a str>) -> Result<WithPos<&'a Path>, WithPos<ControllerLoadReportKind<'static>>> {
                 let path: WithPos<&Path> = path.map(|s| s.trim().as_ref());
                 if path.val == Path::new("") {
-                    log_report(ControllerLoadReport { file, src, pos: path.pos, kind: SchemaError(ClipValueEmpty) });
-                    None
+                    Err(path.pos.with(SchemaError(ClipValueEmpty)))
                 } else if path.val.is_absolute() {
-                    log_report(ControllerLoadReport { file, src, pos: path.pos, kind: SchemaError(ClipValueAbsolute) });
-                    None
+                    Err(path.pos.with(SchemaError(ClipValueAbsolute)))
                 } else {
-                    Some(path)
+                    Ok(path)
                 }
             }
 
@@ -510,32 +370,33 @@ impl SpriteController {
             for clip_entry in table.pop_all("clip") {
                 match clip_entry.val.val {
                     toml::Value::String(path) => {
-                        if let Some(path) = validate_clip_path(clip_entry.val.pos.with(path), file, src) {
-                            clip_infos.push((path, 1.0, None));
+                        match validate_clip_path(clip_entry.val.pos.with(path)) {
+                            Ok(path) => clip_infos.push((path, 1.0, None)),
+                            Err(e) => report_error(e),
                         }
                     }
                     toml::Value::Table(mut clip) => {
                         let path = if let Some(path_entry) = clip.pop("path") {
                             let path = if let toml::Value::String(s) = path_entry.val.val { s } else {
-                                log_report(ControllerLoadReport { file, src, pos: path_entry.val.pos, kind: SchemaError(ClipPathNotString) });
+                                report_error(path_entry.val.pos.with(SchemaError(ClipPathNotString)));
                                 continue;
                             };
-                            let Some(path) = validate_clip_path(path_entry.val.pos.with(path), file, src) else {
-                                continue;
-                            };
-                            path
+                            match validate_clip_path(path_entry.val.pos.with(path)) {
+                                Ok(path) => path,
+                                Err(e) => { report_error(e); continue; }
+                            }
                         } else {
-                            log_report(ControllerLoadReport { file, src, pos: clip_entry.val.pos, kind: SchemaError(ClipPathMissing) });
+                            report_error(clip_entry.val.pos.with(SchemaError(ClipPathMissing)));
                             continue;
                         };
 
                         let weight = if let Some(weight_entry) = clip.pop("weight") {
                             let weight = if let toml::Value::Number(w) = weight_entry.val.val { w } else {
-                                log_report(ControllerLoadReport { file, src, pos: weight_entry.val.pos, kind: SchemaError(ClipWeightNotNumber(weight_entry.val.val.type_str())) });
+                                report_error(weight_entry.val.pos.with(SchemaError(ClipWeightNotNumber(weight_entry.val.val.type_str()))));
                                 0.0
                             };
                             if weight < 0.0 {
-                                log_report(ControllerLoadReport { file, src, pos: weight_entry.val.pos, kind: SchemaError(ClipWeightNegative) });
+                                report_error(weight_entry.val.pos.with(SchemaError(ClipWeightNegative)));
                                 0.0
                             } else {
                                 weight
@@ -547,50 +408,62 @@ impl SpriteController {
                         let _ = clip.pop("loop_count");
 
                         for e in clip.0 {
-                            log_report(ControllerLoadReport { file, src, pos: e.val.pos, kind: SchemaError(UnrecognizedField) });
+                            report_error(e.val.pos.with(SchemaError(UnrecognizedField)));
                         }
 
                         clip_infos.push((path, weight, None));
                     }
                     _ => {
-                        log_report(ControllerLoadReport { file, src, pos: entry.val.pos, kind: SchemaError(NotAllowedClipType) });
+                        report_error(entry.val.pos.with(SchemaError(NotAllowedClipType)));
                     }
                 }
             }
 
             let mut clips = vec![];
             for (clippath, weight, _) in clip_infos {
-                let path = file.parent().unwrap().slash(clippath.val);
+                let path = path.parent().unwrap().slash(clippath.val);
                 match clipbank.load(&path, size) {
                     Ok(clipid) => clips.push((clipid, weight)),
                     Err(e) => {
-                        log_report(ControllerLoadReport { file, src, pos: clippath.pos, kind: ClipLoadError(e) });
+                        report_error(clippath.pos.with(ClipLoadError(e)));
                         continue
                     }
                 }
             }
 
             if clips.is_empty() {
-                log_report(ControllerLoadReport { file, src, pos: entry.val.pos, kind: SchemaError(NoAvailableClip(entry.key.val)) });
-                return None;
+                report_error(entry.val.pos.with(SchemaError(NoAvailableClip)));
+                return Err(None);
             }
 
             let mut trans = vec![];
             for entry in table.0 {
                 let Some(dest) = get_state_id(entry.key.val) else {
-                    log_report(ControllerLoadReport { file, src, pos: entry.key.pos, kind: SchemaError(UnknownDestState) });
+                    report_error(entry.key.pos.with(SchemaError(UnknownDestState)));
                     continue
                 };
 
                 let cond = if let toml::Value::String(cond) = entry.val.val { cond } else {
-                    log_report(ControllerLoadReport { file, src, pos: entry.val.pos, kind: SchemaError(NonStringCondition(entry.val.val.type_str())) });
+                    report_error(entry.val.pos.with(SchemaError(NonStringCondition(entry.val.val.type_str()))));
                     "false"
                 };
 
                 let cond = match ConditionExpr::load(cond, sensors, params) {
                     Ok(cond) => cond,
                     Err(e) => {
-                        log_report(ControllerLoadReport::from_cond(file, src, entry.val.pos, e));
+                        if matches!(e.val, ConditionError::SemanticError(ConditionSemanticError::UnknownIdentifier(_))) {
+                            let ident = e.span.slice(cond);
+                            if unknown_ident_seen.iter().find(|seen| **seen == ident).is_some() { continue; }
+                            unknown_ident_seen.push(ident);
+                        }
+
+                        if matches!(e.val, ConditionError::SemanticError(ConditionSemanticError::UnknownParam(_))) {
+                            let param = e.span.slice(cond);
+                            if unknown_param_seen.iter().find(|seen| **seen == param).is_some() { continue; }
+                            unknown_param_seen.push(param);
+                        }
+
+                        report_error(ControllerLoadReportKind::from_cond(entry.val.pos, e));
                         continue;
                     }
                 };
@@ -612,7 +485,7 @@ impl SpriteController {
         if ret.current_loop_count_max(clipbank) == 0 {
             ret.make_transition(sensors, clipbank);
         }
-        Some(ret)
+        Ok(ret)
     }
 
     pub fn unload(mut self, sensors: &mut Sensors, clipbank: &mut ClipBank) {

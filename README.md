@@ -475,3 +475,6 @@ See LICENSE.txt for details.
     + currently, the tier is overridden to 9
 - [ ] smart name recognition for builtin sensors
     + currently, builtin sensors requires **exact** device name / interface name that pdh use
+- [ ] more conservative logs
+    + panic!/expect does not leave messages to log file.
+    + manage separate log_details file to keep every level of log?

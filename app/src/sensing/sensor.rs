@@ -1,5 +1,5 @@
 use libloading::{Library, Symbol};
-use std::os::raw::{c_void, c_double};
+use std::os::raw::c_void;
 use std::path::Path;
 use std::ptr::NonNull;
 use crate::base::MYTHIC_VERSION;
@@ -22,7 +22,7 @@ pub struct ABI {
 
 #[derive(Debug)]
 pub struct Sensor {
-    lib: Library,
+    _lib: Library, // Library unloads shared lib when dropped
     vtable: NonNull<ABI>,
     handle: NonNull<c_void>,
     destroyed: bool,
@@ -99,7 +99,7 @@ impl From<OpaqueErrorOwned>  for LoadError { fn from(e: OpaqueErrorOwned)  -> Se
 
 impl Sensor {
     fn errmsg_(vtable: &NonNull<ABI>, errcode: u32) -> OpaqueError<'_> { unsafe {
-        let mut handle = std::ptr::null_mut();
+        let handle = std::ptr::null_mut();
         let mut msg: *const u8 = std::ptr::null_mut();
         let mut len = 0;
         let ret = (vtable.as_ref().message)(handle, errcode, &mut msg, &mut len);
@@ -153,7 +153,7 @@ impl Sensor {
         let handle = NonNull::new(handle)
             .ok_or(LoadError::NullHandle)?;
 
-        Ok(Self { lib, vtable, handle, destroyed: false })
+        Ok(Self { _lib: lib, vtable, handle, destroyed: false })
     }}
 
     #[inline]
@@ -194,15 +194,15 @@ impl Sensor {
     }}
 
     // destroy is only accessible via drop. prevents use-after-destroy
-    pub fn drop(mut self) -> Result<(), OpaqueErrorOwned> { unsafe {
+    pub fn drop(mut self) -> Result<(), OpaqueErrorOwned> {
         self.destroy()
-    }}
+    }
 }
 
 impl Drop for Sensor {
-    fn drop(&mut self) { unsafe {
+    fn drop(&mut self) {
         if ! self.destroyed {
             panic!("Sensor must be dropped manually");
         }
-    }}
+    }
 }
