@@ -126,10 +126,42 @@ impl<'a> PdhArrayAccess<'a> {
     }}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterKind {
+    CpuUsage,
+    BFN(BytesForNameCounterKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BytesForNameCounterKind {
+    DiskRead,
+    DiskWrite,
+    NetworkUp,
+    NetworkDown,
+}
+
 #[derive(Clone)]
 struct GpuCounters {
     utilization_counter: Option<PDH_HCOUNTER>,
     // VRAM via DXGI, not PDH
+}
+
+macro_rules! install_counter_branch {
+    ($self:expr, $name:ident, $query:literal) => {{
+        if $self.$name.is_some() { return true; }
+        let $name = Self::add_multicounter($self.query, w!($query));
+        if $name.is_none() { return false; }
+        $self.$name = $name;
+    }};
+}
+
+macro_rules! uninstall_counter_branch {
+    ($self:expr, $name:ident) => {{
+        let Some($name) = $self.$name else { return true };
+        let ret = PdhRemoveCounter($name);
+        if ret != 0 { return false; }
+        $self.$name = None;
+    }};
 }
 
 impl PdhMetrics {
@@ -145,36 +177,10 @@ impl PdhMetrics {
             // TODO lazy install of counters
             // use PdhRemoveCounter
 
-
             let core_count = Self::get_core_counts().unwrap_or_else(|| {
                 log::error!("could not get cpu core count, using 16 as default");
                 16
             });
-
-            let cpu_counter = Self::add_multicounter(query, w!("\\Processor(*)\\% Processor Time"));
-            if cpu_counter.is_none() {
-                log::error!("could not install cpu performance counter");
-            }
-
-            let disk_read_counter = Self::add_multicounter(query, w!("\\LogicalDisk(*)\\Disk Read Bytes/sec"));
-            if disk_read_counter.is_none() {
-                log::error!("could not install disk read performance counter");
-            }
-
-            let disk_write_counter = Self::add_multicounter(query, w!("\\LogicalDisk(*)\\Disk Write Bytes/sec"));
-            if disk_write_counter.is_none() {
-                log::error!("could not install disk write performance counter");
-            }
-
-            let network_sent_counter = Self::add_multicounter(query, w!("\\Network Interface(*)\\Bytes Sent/sec"));
-            if network_sent_counter.is_none() {
-                log::error!("could not install network sent performance counter");
-            }
-
-            let network_recv_counter = Self::add_multicounter(query, w!("\\Network Interface(*)\\Bytes Received/sec"));
-            if network_recv_counter.is_none() {
-                log::error!("could not install network recv performance counter");
-            }
 
             // Try to add GPU counters (may not be available)
             // let gpu_counters = Self::add_gpu_counters(query);
@@ -191,11 +197,11 @@ impl PdhMetrics {
                 query,
 
                 core_count,
-                cpu_counter,
-                disk_read_counter,
-                disk_write_counter,
-                network_sent_counter,
-                network_recv_counter,
+                cpu_counter: None,
+                disk_read_counter: None,
+                disk_write_counter: None,
+                network_sent_counter: None,
+                network_recv_counter: None,
                 // gpu_counters,
                 // dxgi_adapters,
             }
@@ -248,36 +254,41 @@ impl PdhMetrics {
         }
     }
 
-    /// Get disk read bytes/sec of all devices and put them in the buffer.
+    /// Get disk read/write or network sent/recv (in bytes/sec) of all devices and put them in the buffer.
     /// Call PdhArrayAccess.get to get actual values.
     /// Returns None if reading fails.
-    pub fn get_disk_reads<'a>(&self, buffer: &'a mut MultiCounterReuseBuffer) -> Option<PdhArrayAccess<'a>> { unsafe {
-        let Some(counter) = self.disk_read_counter else { return Some(PdhArrayAccess::nil()) };
+    pub fn get_disk_reads<'a>(&self, buffer: &'a mut MultiCounterReuseBuffer, kind: BytesForNameCounterKind) -> Option<PdhArrayAccess<'a>> { unsafe {
+        use BytesForNameCounterKind::*;
+        let counter = match kind {
+            DiskRead    => self.disk_read_counter,
+            DiskWrite   => self.disk_write_counter,
+            NetworkUp   => self.network_sent_counter,
+            NetworkDown => self.network_recv_counter,
+        };
+        let Some(counter) = counter else { return Some(PdhArrayAccess::nil()) };
         Self::get_multicounter_value(counter, buffer).map(PdhArrayAccess::new)
     }}
 
-    /// Get disk write bytes/sec of all devices and put them in the buffer.
-    /// Call PdhArrayAccess.get to get actual values.
-    /// Returns None if reading fails.
-    pub fn get_disk_writes<'a>(&self, buffer: &'a mut MultiCounterReuseBuffer) -> Option<PdhArrayAccess<'a>> { unsafe {
-        let Some(counter) = self.disk_write_counter else { return Some(PdhArrayAccess::nil()) };
-        Self::get_multicounter_value(counter, buffer).map(PdhArrayAccess::new)
-    }}
+    pub fn install_counter(&mut self, kind: CounterKind) -> bool {
+        match kind {
+            CounterKind::CpuUsage =>                                    install_counter_branch!(self, cpu_counter, "\\Processor(*)\\% Processor Time"),
+            CounterKind::BFN(BytesForNameCounterKind::DiskRead) =>      install_counter_branch!(self, disk_read_counter, "\\LogicalDisk(*)\\Disk Read Bytes/sec"),
+            CounterKind::BFN(BytesForNameCounterKind::DiskWrite) =>     install_counter_branch!(self, disk_write_counter, "\\LogicalDisk(*)\\Disk Write Bytes/sec"),
+            CounterKind::BFN(BytesForNameCounterKind::NetworkUp) =>     install_counter_branch!(self, network_sent_counter, "\\Network Interface(*)\\Bytes Sent/sec"),
+            CounterKind::BFN(BytesForNameCounterKind::NetworkDown) =>   install_counter_branch!(self, network_recv_counter, "\\Network Interface(*)\\Bytes Received/sec"),
+        }
+        true
+    }
 
-    /// Get network sent bytes/sec of all devices and put them in the buffer.
-    /// Call PdhArrayAccess.get to get actual values.
-    /// Returns None if reading fails.
-    pub fn get_network_sent<'a>(&self, buffer: &'a mut MultiCounterReuseBuffer) -> Option<PdhArrayAccess<'a>> { unsafe {
-        let Some(counter) = self.network_sent_counter else { return Some(PdhArrayAccess::nil()) };
-        Self::get_multicounter_value(counter, buffer).map(PdhArrayAccess::new)
-    }}
-
-    /// Get network recv bytes/sec of all devices and put them in the buffer.
-    /// Call PdhArrayAccess.get to get actual values.
-    /// Returns None if reading fails.
-    pub fn get_network_recv<'a>(&self, buffer: &'a mut MultiCounterReuseBuffer) -> Option<PdhArrayAccess<'a>> { unsafe {
-        let Some(counter) = self.network_recv_counter else { return Some(PdhArrayAccess::nil()) };
-        Self::get_multicounter_value(counter, buffer).map(PdhArrayAccess::new)
+    pub fn uninstall_counter(&mut self, kind: CounterKind) -> bool { unsafe {
+        match kind {
+            CounterKind::CpuUsage =>                                    uninstall_counter_branch!(self, cpu_counter),
+            CounterKind::BFN(BytesForNameCounterKind::DiskRead) =>      uninstall_counter_branch!(self, disk_read_counter),
+            CounterKind::BFN(BytesForNameCounterKind::DiskWrite) =>     uninstall_counter_branch!(self, disk_write_counter),
+            CounterKind::BFN(BytesForNameCounterKind::NetworkUp) =>     uninstall_counter_branch!(self, network_sent_counter),
+            CounterKind::BFN(BytesForNameCounterKind::NetworkDown) =>   uninstall_counter_branch!(self, network_recv_counter),
+        }
+        true
     }}
 
     // ========================================================================

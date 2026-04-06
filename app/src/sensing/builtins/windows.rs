@@ -1,33 +1,72 @@
 
 mod pdh;
 
-use pdh::{PdhMetrics, MultiCounterReuseBuffer, PdhArrayAccess};
+use pdh::{PdhMetrics, MultiCounterReuseBuffer, PdhArrayAccess, CounterKind, BytesForNameCounterKind};
 
 use super::super::sensor::OpaqueError;
 
+#[repr(u32)]
 enum OpaqueErrorKind {
+    // Registering errors
     DiskSubfield,
     NetSubfield,
     Unrecognized,
     Trailing,
     TooMany,
     UnknownSid,
+
+    // install/uninstall counter
+    Install(CounterKind),
+    Uninstall(CounterKind),
+
+    Update,
+
+    // Refreshing error
+    // GetCpuUsage,
+    GetRamStat,
+    // GetDiskRead,
+    // GetDiskWrite,
+    // GetNetworkUp,
+    // GetNetworkDown,
+    Get(CounterKind),
 }
 
 impl OpaqueErrorKind {
     fn generate(self, misc: u16) -> OpaqueError<'static> {
         use OpaqueErrorKind::*;
-        let message = match &self {
-            DiskSubfield => "Subfields of 'disk' can be .read, .write or a single character disk label",
-            NetSubfield  => "Subfields of 'net' can be .up, .down or network name interface",
-            Unrecognized => "Unrecognized identifier path",
-            Trailing     => "Unrecognized trailing subfields",
-            TooMany      => "Too many unique identifier path registeration",
-            UnknownSid   => "Tried to unregister Unknown sid",
+        let (errhigh, errlow, message) = match &self {
+            DiskSubfield => (1, 0, "Subfields of 'disk' can be .read, .write or a single character disk label"),
+            NetSubfield  => (2, 0, "Subfields of 'net' can be .up, .down or network name interface"),
+            Unrecognized => (3, 0, "Unrecognized identifier path"),
+            Trailing     => (4, 0, "Unrecognized trailing subfields"),
+            TooMany      => (5, 0, "Too many unique identifier path registeration"),
+            UnknownSid   => (6, 0, "Tried to unregister unseen sid"),
+
+            Install(CounterKind::CpuUsage)                                  => (7, 1, "could not install cpu performance counter"),
+            Install(CounterKind::BFN(BytesForNameCounterKind::DiskRead))    => (7, 2, "could not install disk read performance counter"),
+            Install(CounterKind::BFN(BytesForNameCounterKind::DiskWrite))   => (7, 4, "could not install disk write performance counter"),
+            Install(CounterKind::BFN(BytesForNameCounterKind::NetworkUp))   => (7, 8, "could not install network sent performance counter"),
+            Install(CounterKind::BFN(BytesForNameCounterKind::NetworkDown)) => (7,16, "could not install network recv performance counter"),
+
+            Uninstall(CounterKind::CpuUsage)                                  => (8, 1, "could not uninstall cpu performance counter"),
+            Uninstall(CounterKind::BFN(BytesForNameCounterKind::DiskRead))    => (8, 2, "could not uninstall disk read performance counter"),
+            Uninstall(CounterKind::BFN(BytesForNameCounterKind::DiskWrite))   => (8, 4, "could not uninstall disk write performance counter"),
+            Uninstall(CounterKind::BFN(BytesForNameCounterKind::NetworkUp))   => (8, 8, "could not uninstall network sent performance counter"),
+            Uninstall(CounterKind::BFN(BytesForNameCounterKind::NetworkDown)) => (8,16, "could not uninstall network recv performance counter"),
+
+            Update => (9, 0, "could not properly refresh builtin PDH metrics"),
+
+            GetRamStat                                                    => (10, 0, "could not fetch RAM status"),
+            Get(CounterKind::CpuUsage)                                    => (10, 1, "could not fetch cpu usage using PHD"),
+            Get(CounterKind::BFN(BytesForNameCounterKind::DiskRead))      => (10, 2, "could not fetch disk reads using PHD"),
+            Get(CounterKind::BFN(BytesForNameCounterKind::DiskWrite))     => (10, 4, "could not fetch disk writes using PHD"),
+            Get(CounterKind::BFN(BytesForNameCounterKind::NetworkUp))     => (10, 8, "could not fetch network uploads using PHD"),
+            Get(CounterKind::BFN(BytesForNameCounterKind::NetworkDown))   => (10,16, "could not fetch network downloads using PHD"),
         };
 
+        // note that we need unique errcode for each error kind since the message silence mechanism works on errcode.
         OpaqueError {
-            errcode: self as u32,
+            errcode: errhigh << 16 | errlow,
             message: Ok(message),
             misc,
         }
@@ -37,6 +76,10 @@ impl OpaqueErrorKind {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SenseKindRam { Usage, Total, Free }
 
+// Definition order of variants matters.
+// > When `derive`d on enums, variants are ordered by their top-to-bottom discriminant order.
+// >    From std::cmp::PartialOrd doc.
+// The order is used to sort IdMapItems, so it should arrange sense kinds that uses same counters together.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SenseKind {
     CpuCoreCount,
@@ -61,6 +104,20 @@ impl SenseKind {
             DiskRead(dev) | DiskWrite(dev) | NetworkUp(dev) | NetworkDown(dev)
                 => dev.as_ref().map(|v| v.as_slice()),
             DiskPresence(dev) | NetworkPresence(dev) => Some(dev.as_slice()),
+        }
+    }
+
+    fn to_counter_kind(&self) -> Option<CounterKind> {
+        use BytesForNameCounterKind::*;
+        match self {
+            SenseKind::CpuUsage(_)         => Some(CounterKind::CpuUsage),
+            SenseKind::DiskPresence(_)     => Some(CounterKind::BFN(DiskRead)),
+            SenseKind::DiskRead(_)         => Some(CounterKind::BFN(DiskRead)),
+            SenseKind::DiskWrite(_)        => Some(CounterKind::BFN(DiskWrite)),
+            SenseKind::NetworkPresence(_)  => Some(CounterKind::BFN(NetworkUp)),
+            SenseKind::NetworkUp(_)        => Some(CounterKind::BFN(NetworkUp)),
+            SenseKind::NetworkDown(_)      => Some(CounterKind::BFN(NetworkDown)),
+            SenseKind::CpuCoreCount | SenseKind::Ram(_) => None,
         }
     }
 
@@ -174,34 +231,6 @@ impl SenseKind {
     }
 }
 
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum SenseReadErrorKind {
-    Update = 0,
-    GetCpuUsage,
-    GetRamStat,
-    GetDiskRead,
-    GetDiskWrite,
-    GetNetworkUp,
-    GetNetworkDown,
-}
-
-impl SenseReadErrorKind {
-    fn from(kind: &SenseKind) -> Self {
-        use SenseReadErrorKind::*;
-        use SenseKind::*;
-        match kind {
-            CpuUsage(_)     => GetCpuUsage,
-            Ram(_)          => GetRamStat,
-            DiskRead(_)     => GetDiskRead,
-            DiskWrite(_)    => GetDiskWrite,
-            NetworkUp(_)    => GetNetworkUp,
-            NetworkDown(_)  => GetNetworkDown,
-            _ => unreachable!(),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct IdMapItem {
     kind: SenseKind,
@@ -253,32 +282,26 @@ impl BuiltinSensor {
         Self { inner: pdh, idmap, data, }
     }
 
-    fn make_opaque_err(success: bool, kind: SenseReadErrorKind) -> Result<(), OpaqueError<'static>> {
-        use SenseReadErrorKind::*;
-        if ! success {
-            let msg = match kind {
-                Update => "could not properly refresh builtin PDH metrics",
-                GetCpuUsage      => "could not read cpu usage using PHD",
-                GetRamStat       => "could not read RAM status using PHD",
-                GetDiskRead      => "could not read disk reads using PHD",
-                GetDiskWrite     => "could not read disk writes using PHD",
-                GetNetworkUp     => "could not read network uploads using PHD",
-                GetNetworkDown   => "could not read network downloads using PHD",
-            };
+    // fn make_opaque_err(success: bool, kind: SenseReadErrorKind) -> Result<(), OpaqueError<'static>> {
+    //     use SenseReadErrorKind::*;
+    //     if ! success {
+    //         let msg = match kind {
+    //         };
 
-            Err(OpaqueError { errcode: kind as u32, message: Ok(msg), misc: 0 })
-        } else {
-            Ok(())
-        }
-    }
+    //         Err(OpaqueError { errcode: kind as u32, message: Ok(msg), misc: 0 })
+    //     } else {
+    //         Ok(())
+    //     }
+    // }
 
-    pub fn refresh(&mut self) -> Result<(), OpaqueError<'_>> {
+    pub fn refresh(&mut self) -> Result<(), OpaqueError<'static>> {
         let success = self.inner.update();
-        Self::make_opaque_err(success, SenseReadErrorKind::Update)?;
+        if !success { return Err(OpaqueErrorKind::Update.generate(0)); }
 
         let mut buffer = MultiCounterReuseBuffer::new();
         let mut iter = self.idmap.iter().filter(|x| x.rc > 0).peekable();
 
+        // TODO continue after error?
         while let Some(item) = iter.peek() {
             use SenseKind::*;
             match &item.kind {
@@ -293,7 +316,7 @@ impl BuiltinSensor {
                     let corecount = self.inner.get_cpu_count() as usize;
                     let mut cache = vec![None; corecount + 1]; // the last one is total
                     let success = self.inner.get_cpu_usage_per_core(&mut cache[..], &mut buffer);
-                    Self::make_opaque_err(success, SenseReadErrorKind::GetCpuUsage)?;
+                    if !success { return Err(OpaqueErrorKind::Get(CounterKind::CpuUsage).generate(0)); }
                     // use empty cache on failure
                     while let Some(IdMapItem { kind: CpuUsage(i), .. }) = iter.peek() {
                         let IdMapItem { ema, idx, .. } = iter.next().unwrap();
@@ -309,7 +332,7 @@ impl BuiltinSensor {
                         } else {
                             (false, (0, 0, 0))
                         };
-                    Self::make_opaque_err(success, SenseReadErrorKind::GetRamStat)?;
+                    if !success { return Err(OpaqueErrorKind::GetRamStat.generate(0)); }
 
                     while let Some(IdMapItem { kind: Ram(kind), .. }) = iter.peek() {
                         let IdMapItem { ema, idx, .. } = iter.next().unwrap();
@@ -323,30 +346,21 @@ impl BuiltinSensor {
                 }
 
                 DiskRead(_) | DiskWrite(_) | DiskPresence(_) | NetworkUp(_) | NetworkDown(_) | NetworkPresence(_) => {
-                    let ekind = SenseReadErrorKind::from(&item.kind);
-                    let (success, access) = {
-                        let access = match &item.kind {
-                            DiskPresence(_)     => self.inner.get_disk_reads(&mut buffer),
-                            DiskRead(_)         => self.inner.get_disk_reads(&mut buffer),
-                            DiskWrite(_)        => self.inner.get_disk_writes(&mut buffer),
-                            NetworkPresence(_)  => self.inner.get_network_sent(&mut buffer),
-                            NetworkUp(_)        => self.inner.get_network_sent(&mut buffer),
-                            NetworkDown(_)      => self.inner.get_network_recv(&mut buffer),
-                            _ => unreachable!(),
-                        };
+                    let access = {
+                        let Some(CounterKind::BFN(kind)) = item.kind.to_counter_kind() else { unreachable!() };
+                        let access = self.inner.get_disk_reads(&mut buffer, kind);
 
                         if let Some(access) = access {
-                            (true, access)
+                            access
                         } else {
-                            (false, PdhArrayAccess::nil())
+                            return Err(OpaqueErrorKind::Get(CounterKind::BFN(kind)).generate(0));
                         }
                     };
-                    Self::make_opaque_err(success, ekind)?;
-                    let peek_disc = std::mem::discriminant(&item.kind);
+                    let peek_counter_kind = item.kind.to_counter_kind();
 
                     // consider cache (buffer via access) can be used iff they are of same branch.
                     // this prevents buffer reuse between *Presence and *Read/Write, being slightly inefficient.
-                    while iter.peek().map(|x| std::mem::discriminant(&x.kind) == peek_disc).unwrap_or(false) {
+                    while iter.peek().map(|x| x.kind.to_counter_kind() == peek_counter_kind).unwrap_or(false) {
                         let IdMapItem { kind: k, ema, idx, .. } = iter.next().unwrap();
                         let cache = if let Some(dev) = k.get_device() {
                             access.get(dev)
@@ -376,25 +390,34 @@ impl BuiltinSensor {
 
         let is_bool = matches!(item.kind, SenseKind::DiskPresence(_) | SenseKind::NetworkPresence(_));
 
-        let mut sid = match self.idmap.binary_search_by(|x| x.cmp(&item)) {
-            Ok(i) => {
-                self.idmap[i].rc += 1;
-                self.idmap[i].idx
+        let idmap_idx= match self.idmap.binary_search_by(|x| x.cmp(&item)) {
+            Ok(idmap_idx) => {
+                self.idmap[idmap_idx].rc += 1;
+
+                if self.idmap[idmap_idx].rc == 1 {
+                    // if recycling empty, the sensing value would have not updated for long
+                    let data_idx = self.idmap[idmap_idx].idx;
+                    self.data[data_idx] = 0.0;
+                    log::debug!("found hot idmap slot for registration of {path}: {:?}", self.idmap[idmap_idx])
+                } else {
+                    log::debug!("found cold idmap slot for registration of {path}: {:?}", self.idmap[idmap_idx])
+                }
+                idmap_idx
             }
 
             Err(i) => {
                 item.rc = 1;
 
-                // search empty slot backward
+                // search for empty slot backward
                 let recycle = self.idmap[..i]
                     .iter().enumerate().rev()
-                    .take_while(|(_, x)| x.kind == item.kind)
+                    .take_while(|(_, x)| x.kind.to_counter_kind() == item.kind.to_counter_kind())
                     .find(|(_, x)| x.rc == 0);
 
-                // search empty slot forwared
+                // search for empty slot forwared
                 let recycle = recycle.or_else(|| self.idmap[i..] // arr[arr.len()..] is safe
                     .iter().enumerate()
-                    .take_while(|(_, x)| x.kind == item.kind)
+                    .take_while(|(_, x)| x.kind.to_counter_kind() == item.kind.to_counter_kind())
                     .find(|(_, x)| x.rc == 0)
                 );
 
@@ -403,33 +426,52 @@ impl BuiltinSensor {
                 // We know that # of empty entries in both container are same.
                 // Furthermore, if an entry in data is empty iff corresponding entry in idmap is empty.
 
-                let idx = if let Some((idmap_idx, _)) = recycle {
+                if let Some((idmap_idx, _)) = recycle {
+                    log::debug!("found empty idmap slot for registration of {path}: {:?}", self.idmap[idmap_idx]);
                     // empty slot in idmap found, use corresponding data slot (also empty)
                     let data_idx = self.idmap[idmap_idx].idx;
                     self.data[data_idx] = 0.0;
 
-                    item.idx = data_idx;
-                    self.idmap[data_idx] = item;
-                    data_idx
+                    self.idmap[idmap_idx].kind = item.kind;
+                    self.idmap[idmap_idx].ema  = item.ema ;
+
+                    idmap_idx
 
                 } else {
                     // no empty slot found, create new one
-                    let data_idx = self.data.len();
-                    if data_idx > u16::MAX as usize {
+                    log::debug!("inserting idmap slot for registration of {path}: {:?}", self.idmap);
+                    if self.data.len() >= u16::MAX as usize {
                         return Err(OpaqueErrorKind::TooMany.generate(0));
                     }
+
+                    let data_idx = self.data.len();
                     self.data.push(0.0);
 
                     item.idx = data_idx;
                     self.idmap.insert(i, item);
-                    data_idx
-                };
 
-                // update data to prevent cold reading of just added sensing value
-                self.inner.update();
-                idx
+                    i
+                }
             }
         };
+
+        // In case there has been no registration before, we need to install the counter
+        // We could traverse idmap to check if there alreay exists an entry for it,
+        // since this operation is idempotent with no additional cost it is cheaper going without check.
+        if let Some(counter_kind) = self.idmap[idmap_idx].kind.to_counter_kind() {
+            let success = self.inner.install_counter(counter_kind);
+            if !success {
+                self.idmap[idmap_idx].rc -= 1;
+                // if new slot has been inserted, it will be left empty and will be reused later.
+                return Err(OpaqueErrorKind::Install(counter_kind).generate(0));
+            }
+        }
+
+        // We could update data to prevent cold reading of just added sensing value here,
+        // but update call out of regular refresh interval would ruin ema width.
+        // self.inner.update();
+
+        let mut sid = self.idmap[idmap_idx].idx;
 
         if is_bool {
             sid |= 0x8000;
@@ -448,10 +490,37 @@ impl BuiltinSensor {
         // many unused slots left in containers. (e.g. empty slots from disk.read will never be recycled for cpu.usage)
         // We decided to bare with this space inefficiency, to reduce computation.
         let idx = (sid & 0x7FFF) as usize;
-        let item= self.idmap.iter_mut()
-            .find(|x| x.rc > 0 && x.idx == idx)
+        let (idmap_idx, item) = self.idmap.iter_mut().enumerate()
+            .find(|(i, x)| x.rc > 0 && x.idx == idx)
             .ok_or(OpaqueErrorKind::UnknownSid.generate(0))?;
         item.rc -= 1;
+
+        if item.rc == 0 {
+            if let Some(counter_kind) = item.kind.to_counter_kind() {
+                // let rc_sum = self.idmap.iter()
+                //     .filter(|x| x.kind.to_counter_kind() == Some(counter_kind))
+                //     .map(|x| x.rc)
+                //     .sum::<u32>();
+
+                // collect rc of counter_kind backward
+                let rc_sum_front = self.idmap[..idmap_idx]
+                    .iter().rev()
+                    .take_while(|x| x.kind.to_counter_kind() == Some(counter_kind))
+                    .map(|x| x.rc)
+                    .sum::<u32>();
+
+                // collect rc of counter_kind forwared
+                let rc_sum_rear = self.idmap[idmap_idx..] // arr[arr.len()..] is safe
+                    .iter()
+                    .take_while(|x| x.kind.to_counter_kind() == Some(counter_kind))
+                    .map(|x| x.rc)
+                    .sum::<u32>();
+
+                if rc_sum_front + rc_sum_rear == 0 {
+                    self.inner.uninstall_counter(counter_kind);
+                }
+            }
+        }
         Ok(())
     }
 
