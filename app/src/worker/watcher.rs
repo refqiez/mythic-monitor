@@ -1,50 +1,40 @@
 use crate::base::{AppPath, analize_path, app_paths, AppPathAnalisys};
 use crate::sensing::Sensors;
-use crate::sprites::{ClipBank, SpriteId, Sprites};
+use crate::sprites::{ClipBank, Sprites};
+use super::{AnimatorUpdate, SensingUpdate, DecoderUpdate};
 
 use std::collections::HashSet;
 use std::sync::{mpsc, Arc, RwLock};
 use std::time::Duration;
 use notify::{self, Watcher};
 
-#[derive(Debug)]
-pub enum WindowUpdateKind {
-    Create,
-    Delete,
-    // ModSize, // buffer reallocation needed
-    // Redraw, // size does not change, but needs redraw
-    // Reschedule, // timing changed, need new
-}
-
-#[derive(Debug)]
-pub struct WindowUpdate {
-    pub spriteid: SpriteId,
-    pub kind: WindowUpdateKind,
-}
-
-pub enum SensingUpdate {
-    #[cfg(debug_assertions)]
-    PluginDebugUpdage,
-}
-
 pub struct DirectoryWatcher {
-    window_update_queue: mpsc::Sender<WindowUpdate>,
+    animator_update_queue: mpsc::Sender<AnimatorUpdate>,
     sensing_update_queue: mpsc::Sender<SensingUpdate>,
+    decoder_update_queue: mpsc::Sender<DecoderUpdate>,
 
     sprites: Arc<RwLock<Sprites>>,
     sensors: Arc<RwLock<Sensors>>,
     clipbank: Arc<RwLock<ClipBank>>,
 }
 
+enum FileUpdateHandleResult {
+    Good,
+    Exit,
+    Restart,
+    Pending,
+}
+
 impl DirectoryWatcher {
     pub fn new(
-        window_update_queue: mpsc::Sender<WindowUpdate>,
+        animator_update_queue: mpsc::Sender<AnimatorUpdate>,
         sensing_update_queue: mpsc::Sender<SensingUpdate>,
+        decoder_update_queue: mpsc::Sender<DecoderUpdate>,
         sprites: Arc<RwLock<Sprites>>,
         sensors: Arc<RwLock<Sensors>>,
         clipbank: Arc<RwLock<ClipBank>>,
     ) -> Self {
-        Self { window_update_queue, sensing_update_queue, sprites, sensors, clipbank }
+        Self { animator_update_queue, sensing_update_queue, decoder_update_queue, sprites, sensors, clipbank }
     }
 
     // returns if should be restarted
@@ -76,6 +66,7 @@ impl DirectoryWatcher {
         }
 
         let mut dirty: HashSet<AppPath> = HashSet::new();
+        let mut still_dirty = vec![];
         let debounce_duration = Duration::from_millis(200);
 
         fn filter_notify_event(mut event: notify::Event) -> Option<AppPath> {
@@ -102,7 +93,7 @@ impl DirectoryWatcher {
                     } else { None }
                 }
                 _ => {
-                    log::debug!("ignoring inotify event {event:?}");
+                    log::trace!("ignoring inotify event {event:?}");
                     None
                 }
             }
@@ -110,27 +101,38 @@ impl DirectoryWatcher {
 
         // using per-watcher debounce; rather than per-file debounce
         let ret = 'outer: loop {
-            // wait for next event to happen
-            if let Ok(Ok(res)) = rx.recv() {
-                if let Some(path) = filter_notify_event(res) {
-                    log::debug!("got watcher event (wake) '{path}'");
-                    dirty.insert(path);
+            if still_dirty.is_empty() {
+                // wait for next event to happen
+                if let Ok(Ok(res)) = rx.recv() {
+                    if let Some(path) = filter_notify_event(res) {
+                        log::trace!("got watcher event (wake) '{path}'");
+                        dirty.insert(path);
+                    }
                 }
+            } else {
+                dirty.extend(still_dirty.drain(..));
+                log::trace!("continueing with still_dirty files");
             }
 
             // keep collecting till there's no updates for a duration
             while let Ok(Ok(res)) = rx.recv_timeout(debounce_duration) {
                 if let Some(path) = filter_notify_event(res) {
-                    log::debug!("got watcher event (following) '{path}'");
+                    log::trace!("got watcher event (following) '{path}'");
                     dirty.insert(path);
                 }
             }
+            // NOTE: in unlikely cases when the directory is constantly modified, they will not be processed till end of modification.
 
             // process the updated files
             for path in dirty.drain() {
-                log::debug!("processing updated file '{path}'");
-                let keep_going = self.handle_file_reload(&path);
-                if keep_going != 0 { break 'outer keep_going == 2; }
+                log::trace!("processing updated file '{path}'");
+                use FileUpdateHandleResult::*;
+                match self.handle_file_update(&path) {
+                    Good => (),
+                    Exit => break 'outer false,
+                    Restart => break 'outer true,
+                    Pending => still_dirty.push(path),
+                }
             }
 
             // exiting the function, drop the object to shut down other threads
@@ -141,83 +143,65 @@ impl DirectoryWatcher {
     }
 
     // 0: keep_going, 1: exit, 2: restart
-    fn handle_file_reload(&mut self, path: &AppPath) -> u8 {
+    fn handle_file_update(&mut self, path: &AppPath) -> FileUpdateHandleResult {
+        use FileUpdateHandleResult::*;
         match analize_path(path) {
-            AppPathAnalisys::Clip(_)    => self.reload_webp(path),
-            AppPathAnalisys::SpriteList => self.reload_list_toml(path),
-            AppPathAnalisys::Sprite(_)  => self.reload_sprite_toml(path),
+            AppPathAnalisys::Clip(_)    => { self.reload_webp(path); Good }
+            AppPathAnalisys::SpriteList => if self.reload_list_toml(path) { Good } else { Pending }
+            AppPathAnalisys::Sprite(_)  => if self.reload_sprite_toml(path) { Good } else { Pending }
 
-            AppPathAnalisys::Running    => {
-                // halt if not exist
-                return if app_paths().running.exists() {0} else {1};
-            }
+            // halt if not exist
+            AppPathAnalisys::Running    => if app_paths().running.exists() { Good } else { Exit }
 
             #[cfg(debug_assertions)]
             AppPathAnalisys::PluginDebug => {
                 _ = self.sensing_update_queue.send(SensingUpdate::PluginDebugUpdage);
+                Good
             }
 
-            AppPathAnalisys::Plugin(_)  => {
-                return 2;
-            }
+            AppPathAnalisys::Plugin(_)  => Restart,
 
             AppPathAnalisys::TempL(_)   => unreachable!(),
             AppPathAnalisys::Log        => unreachable!(),
             AppPathAnalisys::Lock       => unreachable!(),
             AppPathAnalisys::Unknown    => {
                 log::info!("ignoring updates from '{path}'");
+                Good
             }
         }
-
-        return 0;
     }
 
-    pub fn reload_list_toml(&mut self, path: &AppPath) {
+    pub fn reload_list_toml(&mut self, path: &AppPath) -> bool {
         log::info!("reloading list_toml at '{path}'");
         let mut sprites = self.sprites.write().expect("poisoned sprites lock");
         let mut sensors = self.sensors.write().expect("poisoned sensors lock");
         let mut clipbank= self.clipbank.write().expect("poisoned clipbank lock");
-        sprites.reload(path, &mut sensors, &mut clipbank, |upd| {
-            _ = self.window_update_queue.send(upd);
-            // ignoring SendError, which only occurs when the consumer is dropped
-        });
+        sprites.reload(path, &mut sensors, &mut clipbank)
     }
 
-    pub fn reload_sprite_toml(&mut self, path: &AppPath) {
+    pub fn reload_sprite_toml(&mut self, path: &AppPath) -> bool {
         log::info!("reloading sprite_toml with '{path}'");
         // FIXME this may result in no updates, but we still acquires lock.
         // this may unnecessarily stagger the watcher if there is many un-tracked toml files are added to the directory
         let mut sprites = self.sprites.write().expect("poisoned sprites lock");
         let mut sensors = self.sensors.write().expect("poisoned sensors lock");
         let mut clipbank= self.clipbank.write().expect("poisoned clipbank lock");
-        sprites.reload_sprite(path, &mut sensors, &mut clipbank, |upd| {
-            _ = self.window_update_queue.send(upd);
-            // ignoring SendError, which only occurs when the consumer is dropped
-        });
+        sprites.reload_sprite(path, &mut sensors, &mut clipbank)
     }
 
     pub fn reload_webp(&mut self, path: &AppPath) {
         // refresh clips in the clipbank
-        let mut clipbank = self.clipbank.write().expect("poisoned clipbank lock");
         let sprites = self.sprites.read().expect("poisoned sprites lock");
+        let mut clipbank = self.clipbank.write().expect("poisoned clipbank lock");
         // FIXME this may result in no updates, but we still acquires lock.
         // this may unnecessarily stagger the watcher if there is many un-tracked image files are added to the directory
-        for (clipid, err) in clipbank.reload(path) {
-            if let Some(e) = err {
-                log::error!("could not reload clip from '{path}' ({e:?})"); // FIXME more gracefull error report
-                break;
+        match sprites.reload_clip(path, &mut clipbank) {
+            Err(e) =>
+                log::error!("could not reload clip from '{path}' ({e:?})"), // FIXME more graceful error report?
+            Ok(true) => {
+                _ = self.decoder_update_queue.send(DecoderUpdate::Rescan);
             }
-
-            // find sprites having the update clip as current clip, and notify window renderer
-            for (spriteid, (decl, _)) in sprites.iter() {
-                if let Some(scon) = decl.get_sprite() {
-                    if scon.current_clip() == clipid {
-                        // self.update_queue.send(WindowUpdate::ModBuffer(SpriteId(id)));
-                        _ = self.window_update_queue.send(WindowUpdate { spriteid, kind: WindowUpdateKind::Delete });
-                        _ = self.window_update_queue.send(WindowUpdate { spriteid, kind: WindowUpdateKind::Create });
-                    }
-                }
-            }
+            Ok(false) => (), // no-op
         }
     }
 

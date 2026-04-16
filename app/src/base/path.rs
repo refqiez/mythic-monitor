@@ -111,6 +111,10 @@ impl AppPath {
         self.0.push(path);
         self
     }
+
+    pub fn join(&self, path: impl AsRef<Path>) -> AppPath {
+        AppPath(self.0.join(path))
+    }
 }
 
 impl AsRef<Path> for AppPath {

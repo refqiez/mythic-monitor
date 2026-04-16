@@ -1,7 +1,3 @@
-use std::{mem, ptr};
-use std::time::{Instant, Duration};
-use core::cmp::Reverse as R;
-
 use windows::{
     core::*,
     Win32::{
@@ -16,6 +12,7 @@ use windows::{
 
 struct WindowState {
     hwnd: HWND,
+    size: (usize, usize),
     hdc_mem: HDC,
     dib: HBITMAP,
     bits: *mut u8,
@@ -53,6 +50,21 @@ impl WindowState {
         // - Where your frame pixels live
         let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
 
+        let mut ret = WindowState {
+            hwnd,
+            hdc_mem,
+            alive: true,
+
+            dib: Default::default(),
+            bits: Default::default(),
+            size: (0, 0),
+        };
+
+        ret.realloc_bitmap(width, height)?;
+        Ok(ret)
+    }
+
+    pub fn realloc_bitmap(&mut self, width: usize, height: usize) -> Result<()> { unsafe {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -68,7 +80,7 @@ impl WindowState {
 
         let mut bits = ptr::null_mut();
         let dib = CreateDIBSection(
-            Some(hdc_mem),
+            Some(self.hdc_mem),
             &bmi,
             DIB_RGB_COLORS,
             &mut bits,
@@ -76,16 +88,19 @@ impl WindowState {
             0,
         )?;
 
-        SelectObject(hdc_mem, dib.into());
+        let old_bitmap = SelectObject(self.hdc_mem, dib.into());
+        if !old_bitmap.is_invalid() {
+            let ret = DeleteObject(old_bitmap as _);
+            if ! ret.as_bool() {
+                log::warn!("DeleteObject failed");
+            }
+        }
 
-        Ok(WindowState {
-            hwnd,
-            hdc_mem,
-            dib,
-            bits: bits as *mut u8,
-            alive: true,
-        })
-    }
+        self.size = (width, height);
+        self.bits = bits as *mut u8;
+        self.dib = dib;
+        Ok(())
+    }}
 
     pub fn destroy(mut self) -> Result<()> { unsafe {
         DestroyWindow(self.hwnd)?;
@@ -117,22 +132,29 @@ unsafe extern "system" fn window_proc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-use std::collections::{HashMap, BinaryHeap};
 
-use super::RenderDataInterface;
-use crate::base::Align;
-use crate::sprites::SpriteId;
-use crate::worker::watcher::{WindowUpdate, WindowUpdateKind};
+use crate::sprites::{ClipBank, Sprites};
+use super::super::{AnimatorUpdate, DecoderUpdate};
+use crate::sensing::Sensors;
 
-pub struct Renderer {
-    windows: HashMap<SpriteId, WindowState>,
+use std::collections::BinaryHeap;
+use std::{mem, ptr, sync};
+use std::time::{Instant, Duration};
+use core::cmp::Reverse as R;
+
+pub struct Animator {
+    windows: Vec<WindowState>,
 
     class: PCWSTR,
     wc: WNDCLASSW,
     hdc_screen: HDC,
 
-    interface: RenderDataInterface,
-    queue: BinaryHeap<R<(Instant, SpriteId)>>
+    sprites: sync::Arc<sync::RwLock<Sprites>>,
+    sensors: sync::Arc<sync::RwLock<Sensors>>,
+    clipbank: sync::Arc<sync::RwLock<ClipBank>>,
+    queue: BinaryHeap<R<(Instant, usize)>>,
+    update_queue: sync::mpsc::Receiver<AnimatorUpdate>,
+    decoder_update_queue: sync::mpsc::Sender<DecoderUpdate>,
 }
 
 const BLEND: BLENDFUNCTION = BLENDFUNCTION {
@@ -142,8 +164,14 @@ const BLEND: BLENDFUNCTION = BLENDFUNCTION {
     AlphaFormat: AC_SRC_ALPHA as u8,
 };
 
-impl Renderer {
-    pub fn init(interface: RenderDataInterface) -> Result<Self> { unsafe {
+impl Animator {
+    pub fn init(
+        sprites: sync::Arc<sync::RwLock<Sprites>>,
+        sensors: sync::Arc<sync::RwLock<Sensors>>,
+        clipbank: sync::Arc<sync::RwLock<ClipBank>>,
+        update_queue: sync::mpsc::Receiver<AnimatorUpdate>,
+        decoder_update_queue: sync::mpsc::Sender<DecoderUpdate>,
+    ) -> Result<Self> { unsafe {
         let class = w!("webp_overlay");
 
         let wc = WNDCLASSW {
@@ -163,78 +191,111 @@ impl Renderer {
         let hdc_screen = GetDC(None);
 
         Ok(Self {
-            windows: HashMap::new(),
+            windows: vec![],
             class, wc, hdc_screen,
 
-            interface,
+            sprites, sensors, clipbank,
             queue: BinaryHeap::new(),
+            update_queue, decoder_update_queue,
         })
     }}
 
-    fn process_update(&mut self, upd: WindowUpdate) -> Result<()> {
-        log::debug!("processing window update message {upd:?}");
-        match upd.kind {
-            WindowUpdateKind::Create => {
-                let (width, height) = self.interface.with_frame(upd.spriteid, |_, frame| (frame.width(), frame.height())).unwrap();
-                let ws = unsafe { WindowState::new(self.class, self.wc, self.hdc_screen, width, height)? };
-                if let Some(ws) = self.windows.insert(upd.spriteid, ws) {
-                    log::error!("tried to insert twice with existing sprite_id = {:?}", upd.spriteid);
-                    if let Err(e) = ws.destroy() {
-                        log::error!("error while destroying window ({e})");
-                    }
-                }
+    fn apply_sprite_updates(&mut self) {
+        let need_update = self.sprites.read().expect("poisoned sprites lock").is_pending_update_present();
 
-                self.queue.push(R((Instant::now(), upd.spriteid)));
-            }
+        if ! need_update { return; }
 
-            WindowUpdateKind::Delete => {
-                if let Some(ws) = self.windows.remove(&upd.spriteid) {
-                    if let Err(e) = ws.destroy() {
-                        log::error!("error while destroying window ({e})");
-                    }
+        let mut sprites = self.sprites.write().expect("poisoned sprites lock");
+        let mut sensors = self.sensors.write().expect("poisoned sensors lock");
+        let mut clipbank = self.clipbank.write().expect("poisoned clipbank lock");
+        let Some(new_indices) = sprites.apply_sprite_updates(&mut sensors, &mut clipbank) else { return };
+
+        let mut updated = vec![false; sprites.len()];
+
+        // relocate queue
+
+        let mut new_queue = BinaryHeap::new();
+        for R((instant, sprite_idx)) in self.queue.as_slice() { // BinaryHeap::as_mut_slice() is yet unstable
+            let Some(new_idx) = new_indices[*sprite_idx] else { continue };
+            updated[new_idx] = true;
+            new_queue.push(R((*instant, new_idx)));
+        }
+
+        for (new_sprite_idx, _) in updated.iter().enumerate().filter(|(_,b)| !**b) {
+            // for sprites that are not ssen in the queue, these are newly added ones
+            new_queue.push(R((Instant::now(), new_sprite_idx)));
+        }
+
+        self.queue = new_queue;
+
+        // relocate windows
+
+        unsafe {
+            let mut new_windows = vec![];
+            for _ in 0 .. sprites.len() { new_windows.push(mem::zeroed()); }
+            for (_sprite_idx, (new_idx, ws)) in new_indices.iter().zip(self.windows.drain(..)).enumerate() {
+                if let Some(new_idx) = new_idx {
+                    new_windows[*new_idx] = ws;
                 } else {
-                    log::error!("tried to delete non-existing sprite with sprite_id = {:?}", upd.spriteid);
+                    if let Err(e) = ws.destroy() {
+                        log::error!("{}", e.message());
+                    }
                 }
-                self.queue.retain(|R((_,spriteid))| *spriteid != upd.spriteid);
             }
+            for (new_sprite_idx, _) in updated.iter().enumerate().filter(|(_,b)| !**b) {
+                let (width, height) = sprites.get_bounding_size(new_sprite_idx, &clipbank);
+                let ws = match WindowState::new(self.class, self.wc, self.hdc_screen, width, height) {
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        log::error!("{}", e.message());
+                        panic!();
+                    }
+                };
+                new_windows[new_sprite_idx] = ws;
+            }
+        }
+    }
 
-            // WindowUpdate::ModSize => { }
-            // WindowUpdate::ModBuffer => { }
+    fn process_update(&mut self, upd: AnimatorUpdate) -> Result<()> {
+        log::debug!("processing window update message {upd:?}");
+
+        match upd {
+            AnimatorUpdate::UpdateQueued => {
+                self.apply_sprite_updates();
+                _ = self.decoder_update_queue.send(DecoderUpdate::Rescan);
+            }
         }
 
         Ok(())
     }
 
-    fn redraw_sprite(&mut self, spriteid: SpriteId) -> Result<Option<u32>> {
+    fn redraw_sprite(&mut self, sprite_idx: usize) -> Result<Option<u32>> {
+        let mut sprites = self.sprites.write().expect("poisoned sprites lock");
+        let mut sensors = self.sensors.write().expect("poisoned sensors lock");
+        let mut clipbank = self.clipbank.write().expect("poisoned clipbank lock");
+        let frame = sprites.get_current_frame(sprite_idx, &clipbank);
 
-        pub fn start_pos((align, pos): (Align, i32), stretch: i32) -> i32 {
-            match align {
-                Align::Start => pos,
-                Align::Center => pos - stretch/2,
-                Align::End => pos - stretch,
-            }
+        let ws = &mut self.windows[sprite_idx];
+        let (width, height) = frame.size;
+        let (x, y) = frame.pos;
+
+        if ws.size.0 < width || ws.size.1 < height {
+            let (w, h) = sprites.get_bounding_size(sprite_idx, &clipbank);
+            ws.realloc_bitmap(w, h)?;
         }
 
-        let Some(delay): Option<Result<u32>> = self.interface.with_frame(spriteid, |sprite, frame| unsafe {
-            let ws= self.windows.get_mut(&spriteid).unwrap();
-            let width = frame.width();
-            let height = frame.height();
+        let size = SIZE {
+            cx: width  as i32,
+            cy: height as i32,
+        };
+        let src = POINT { x: 0, y: 0 };
+        let dst = POINT { x: x, y: y };
 
-            let x = start_pos(sprite.xpos, width as i32);
-            let y = start_pos(sprite.ypos, height as i32);
-
-            let size = SIZE {
-                cx: frame.width()  as i32,
-                cy: frame.height() as i32,
-            };
-            let src = POINT { x: 0, y: 0 };
-            let dst = POINT { x: x, y: y };
-
-            let pixels = frame.pixels();
+        unsafe {
             ptr::copy_nonoverlapping(
-                pixels.as_ptr(),
+                frame.pixels.as_ptr(),
                 ws.bits,
-                pixels.len(),
+                frame.pixels.len(),
             );
 
             UpdateLayeredWindow(
@@ -247,18 +308,16 @@ impl Renderer {
                 COLORREF(0),
                 Some(&BLEND),
                 ULW_ALPHA,
-            ).map(|_| frame.delay())
-            // Ok(frame.delay())
-        }) else {
-            // with_frame returns None when the sprite does not exist or don't have loaded SpriteController.
-            // The former would happen on late delivery of Delete event.
-            // The later indicate some bugs in the code.
-            // Either case, we ignore and return.
-            return Ok(None);
-        };
-        let delay  = delay?;
+            )?;
+        }
 
-        self.interface.advance(spriteid);
+        let delay = frame.delay_ms;
+        // drop(frame) to mutably borrow clipbank
+
+        sprites.advance(sprite_idx, &mut sensors, &mut clipbank);
+        if let Some(clipid) = sprites.get_current_clipid(sprite_idx) {
+            _ = self.decoder_update_queue.send(DecoderUpdate::Advanced(clipid));
+        }
 
         Ok(Some(delay))
     }
@@ -298,11 +357,11 @@ impl Renderer {
                         next_run.duration_since(now)
                     }
                 }
-                None => Duration::from_secs(1),
+                None => Duration::from_secs(1), // would check for update_queue at every second
             };
 
             // log::trace!("wait_duration: {wait_duration:?}");
-            match self.interface.update_queue.recv_timeout(wait_duration) {
+            match self.update_queue.recv_timeout(wait_duration) {
                 Ok(upd) =>
                     self.process_update(upd)?,
 
@@ -311,6 +370,8 @@ impl Renderer {
 
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
+
+            self.apply_sprite_updates();
         }
 
         log::info!("WindowsRednerer exiting");
@@ -318,9 +379,9 @@ impl Renderer {
     }
 }
 
-impl Drop for Renderer {
+impl Drop for Animator {
     fn drop(&mut self) {
-        for (_, ws) in self.windows.drain() {
+        for ws in self.windows.drain(..) {
             if let Err(e) = ws.destroy() {
                 log::error!("error while destroying window ({e})");
             }

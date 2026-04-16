@@ -38,7 +38,7 @@ TODO
 All configuration is done via editing files in the filesystem.
 See the `examples` directory for working samples.
 
-## Terminology
+## Glossary
 
 **widget**: A runtime entity displayed on the desktop. Widgets appear as always-on-top, click-through overlays that render animated sprites reacting to system activity. Conceptually widgets are _sprite definition_ + _window render_.
 
@@ -98,7 +98,7 @@ The directory structure is as follows
 │       └── gpu.so       # linux shared library format
 └── misc/
     ├── config.toml      # non-widget configurations
-    ├── running          # indication of process running, delete this to shut it down
+    ├── running          # indication of process running, delete this to shut down
     ├── now.log          # current log file
     └── [epochtime].log  # old log files
 ```
@@ -107,7 +107,7 @@ The program watches `sprites` and `plugins` directories recursively. Any changes
 
 ## Format
 
-Most configuration files use a simplified subset of TOML. This custom format intentionally restricts some TOML features in order to keep the parser small and fast.
+Most configuration files adopts simplified subset of TOML. This custom format intentionally restricts some TOML features in order to keep the parser small and fast.
 
 The syntax remains largely compatible with standard TOML, but several features are not supported or behave differently. For the complete specification, see [toml.md](app/src/parser/toml.md).
 
@@ -117,7 +117,7 @@ Notable differences are:
 - No nested table access via dotted keys.
 - Allows duplicated keys.
 
-If not state otherwise, the last assigned values are prefered for duplicated keys.
+If not stated otherwise, the last assigned values are prefered for duplicated keys.
 
 ### version
 
@@ -142,50 +142,48 @@ version = "=1."   # same as above
 ### `sprites/list.toml`
 
 The `sprite/list.toml` file defines all widgets to be loaded.
-Each section in this file represents a single widget, with the section name serving as the widget's runtime name. (currently wdget name has no use)
+Each _section_ in this file represents a single widget, with the section name serving as the widget's runtime label.
 
 Fields:
 - **`sprite`**: A string specifying the path to the sprite definition. Paths are relative to the directory of `list.toml`.
     + If the path refers to a `.toml` file, that file is loaded as the sprite definition.
     + If the path refers to a directory containing exactly one `.toml` file, that file is loaded.
     + Otherwise, an error occurs.
-
-- **`size.width`, `size.height`**: Widget dimensions in pixels.
-    + If **both** are specified → clips are rescaled to match both dimensions.
-    + If **only one** is specified → clips are rescaled, maintaining original aspect ratio.
-    + If **neither** is specified → clips are rendered at their original size.
-
-- **`pos.*`**: Widget screen position. Values are in pixels relative to the top-left of the screen.
-    + vertical: `top`, `ycenter`, `bottom`
-    + Horizontal: `left`, `xcenter`, `right`
-
-- **`param.*`**: Parameter to be sent to the sprite that will be used in TCEs. Must be string value. See [sprites.toml](#spritesspritetoml)
+- **`scale`**: Size and offset scaling of the sprite. Default is 1.
+- **`pos.x`**, **`pos.y`**: Widget's position on screen in pixels from the top-left corner of the screen. Defaults are `0`.
+- **`param.*`**: Parameters to be used in the sprite's TCEs. Must be string value. See [sprites.toml](#spritesspritetoml)
 
 ```toml
-[sonic1]
+[sonic-cpu]
 sprite = "sonic"
 param.sensor = "cpu"
-size.width = 500
-size.height = 100
-pos.bottom = 150
-pos.xcenter = 100
+scale = 2
+pos.x = 150
+pos.y = 100
 ```
 
 ### `sprites/**/[sprite].toml`
 
-Sprite definition files describe widgets' states and behavior. The file can have any name with a `.toml` extension and can be nested as deeply as you want.
+Sprite definition files describe widgets' states and behavior. The file can have any name with `.toml` extension and can be nested as deeply as you want.
 
-Each section defines a state, having section name as name of the state.
+Each _section_ defines a state, having section name as name of the state. A sprite must define at least one state.
 
-Fields:
+Section fields:
 
 - **`clip`**
     + If it is a string, it is a path to a `.webp` file, relative to the current `.toml` file.
     + If it is an inline table, it may contain the following keys:
-        * `path` (string, required) – relative path to the `.webp` file
-        * `weight` (integer, optional, default: 1) – used when a state has multiple clips, to influence random selection
-        * `loop_count` (integer, optional) – overrides loop_count from `.webp` file, specifying the number of times the clip should play before evaluating transitions.
-- **`[state_name]`**
+        * **`path`** (string, required) – relative path to the `.webp` file
+        * **`weight`** (integer, optional, default: 1) – used when a state has multiple clips, to influence random selection
+        * **`loop_count`** (integer, optional) – overrides loop_count from `.webp` file's metadata, specifying the number of times the clip should play before evaluating transitions. (See below for more info)
+        * **`size.width`, `size.height`** (integer, optional) - Clip dimensions in pixels.
+            + If **both** are specified → clip is rescaled to match both dimensions.
+            + If **only one** is specified → clip is rescaled, maintaining original aspect ratio.
+            + If **neither** is specified → clip is rendered with their original size.
+        * **`offset.x`**, **`offset.y`** (integer, optional) - clip position offset from sprite origin.
+        * **`lazy_decode`** (boolean, optional) - force lazy decoding of clip frames.
+        * **`lazy_rescale`** (boolean, optional) - force rescaling at redering time instead of decoding time. has no effect if lazy_decode is set to false.
+- **`<state_name> = <TCE>`**
     + Transition fields are named after other states.
     + The value is a TCE.
     + Sensing values can be read using _identifier path_ s.
@@ -241,8 +239,7 @@ load2 = "$sensor > 0.4"
 
 ### `sprites/running`
 
-This file is used to indicate that the program is currently running.
-
+Existence of this file indicates that the program is currently running.
 - created on program startup.
 - removed on program shutdown.
 - Delete it while the program is running to shut down immediately.
@@ -250,24 +247,24 @@ This file is used to indicate that the program is currently running.
 ### `plugins/`
 
 Plugins extend the sensing sources, by making additional metrics available for use in TCEs.
-Whenever new shared libraries are put into `plugins` directory, the program restarts to lo load them.
+Whenever new shared libraries are put into `plugins` directory (at any depth), the program restarts to load them.
 
-They typically provide system metrics
- can supply **any value**, depending on their implementation. Examples includes but not limited to:
+Albeit plugins typically provide system metrics, they can supply **any value**, depending on their implementation.
+Examples include but not limited to:
 - Email notification status
 - Today’s weather
 - Calendar events or reminders
 
 See [Plugins](#Plugins-1) for detailed information on writing and integrating plugins.
 
-Note that any shared library files placed in `plugins` are continuously detected & loaded. So be careful not to put untrusty files in.
+**Note that any shared library files placed in `plugins` are continuously detected & loaded. So be careful not to put untrusty files in.**
 
 ### `misc/config.toml`
 
-This file contains non-widget settings.
-It is not monitored for updated, you need to manually restart the program to apply updates made in the config.
+This file contains non-widget, system-wide settings.
+It is not monitored for update, you need to manually restart the program to apply updates made in the config.
 
-Fidls:
+Fields:
 - **`max-log-level`**: maximum level of log messages to produce.
   - Type: `string`
   - Default: `"warn"`
@@ -279,16 +276,9 @@ Fidls:
     - Default: `10`
     - Provided values will be floored, clamped between 0 and 100
 
-- **`online-decoding`**: controls how sprite clips are loaded and decoded.
-    - Type: `boolean`
-    - Default: `false`
-    - when **`false`**: Clips are fully decoded, and all frames are loaded into memory at startup.
-    - when **`true`**: Clips are loaded in compressed form, and frames are decoded on demand when displayed.
-    - Adjust `online-decoding` if you want to reduce memory usage at the cost of slightly higher CPU load when rendering clips.
-
 ### Log Files (`misc/*.log`)
 
-On startup, a `mist/now.log` is created to output messages.
+On startup, a `misc/now.log` is created to output messages.
 
 - Logs capture all messages from the program, including:
     + Clip load error messages
@@ -310,7 +300,7 @@ On startup, a `mist/now.log` is created to output messages.
 - `misc/.lock`: Exclusive file lock that allows only one mythic process access `app_root`. If you know there's mythic process running but keep getting directory lock error, consider removing this file manually.
 - `./.templ`: Directory to keep loaded plugin libraries. Automatically managed.
 
-## Command Line Arguments
+## CommandLine Arguments
 
 Some settings are configured via commandline arguments. e.g. overriding `app_root`, prevent writing to `now.log`.
 Run the program with `--help` for more info.
@@ -453,24 +443,8 @@ See LICENSE.txt for details.
 
 # TODO
 
-- [ ] loop_count override
-    + currently Clip holds loop_count. individual sprites cannot override it
-- [ ] per clip position offset
-    + enable specifying clip offsets from sprites position
-    + allows fine-grained tuning when assembling clips
-    + allows 'moving' sprites
-- [ ] flexible sprite size
-    + allowing autosize (omitting width/height or both) will allow clips of a sprite to have different sizes, which will make rendering buffer allocation hard.
-    + currently both width and height need to be specified. all clips will be rescaled to match this size.
-    + so, all clips of a sprite better have same aspect ratio.
-- [ ] allow sprite state without clip
-    + have 'empty' clip and with loop-count 0
-- [ ] online decoding config
-- [ ] rescale method config
 - [ ] numeric parameters
 - [ ] partial update when plugin updates
-- [ ] partial update when list.toml updates
-- [ ] partial update when sprite.toml updates
 - [ ] plugin refresh tier
     + currently, the tier is overridden to 9
 - [ ] smart name recognition for builtin sensors
@@ -478,3 +452,7 @@ See LICENSE.txt for details.
 - [ ] more conservative logs
     + panic!/expect does not leave messages to log file.
     + manage separate log_details file to keep every level of log?
+- [ ] make debug plugin into release
+    + would be helpful when testing plugins
+- [ ] make toml/expr work on unicodes.
+    + and other string related funcs (especially from base.rs)

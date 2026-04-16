@@ -1,6 +1,6 @@
+#![allow(unused)]
 use super::{WithSpan, Span};
-use crate::sensing::SensingId;
-use crate::sprites::{TypeResolver, ValueResolver};
+
 /// Lexer
 
 #[derive(Debug, Copy, Clone)]
@@ -281,6 +281,14 @@ impl<'src> Lexer<'src> {
 
 /// Parser
 
+pub trait TypeResolver<IdentId, IdentErr> {
+    fn resolve_type(&mut self, path: &str) -> Result<(Type, IdentId), WithSpan<IdentErr>>;
+}
+
+pub trait ValueResolver<IdentId> {
+    fn resolve_value(&self, sid: IdentId) -> Value;
+}
+
 pub struct Arena<T> {
     nodes: Vec<T>,
 }
@@ -360,11 +368,11 @@ pub enum BinOp {
 }
 
 #[derive(Debug)]
-pub enum Expr {
+pub enum Expr<IdentId> {
     Float(f64),
     Bool(bool),
     Ident(Span),
-    Sensing(SensingId),
+    IdentId(IdentId),
 
     Unary { op: UnaryOp, expr: ExprId, },
     Binary { lhs: ExprId, op: BinOp, rhs: ExprId, }, // only holds arith ops
@@ -396,15 +404,15 @@ fn infix_bp(kind: &Token) -> Option<(u8, u8, BinOp)> {
     })
 }
 
-pub struct Parser<'src> {
+pub struct Parser<'src, IdentId> {
     src: &'src str,
     lexer: Lexer<'src>,
     lookahead: Result<WithSpan<Token>, WithSpan<LexError>>,
-    arena_expr: Arena<Expr>,
+    arena_expr: Arena<Expr<IdentId>>,
     arena_span: Arena<Span>,
 }
 
-impl<'src> Parser<'src> {
+impl<'src, IdentId> Parser<'src, IdentId> {
     pub fn new(src: &'src str) -> Self {
         let mut lexer = Lexer::new(src);
         let lookahead = lexer.next_token();
@@ -423,7 +431,7 @@ impl<'src> Parser<'src> {
         self.lookahead = self.lexer.next_token();
     }
 
-    pub fn parse(mut self) -> Result<(Arena<Expr>, Arena<Span>, Option<ExprId>), WithSpan<ParseError>> {
+    pub fn parse(mut self) -> Result<(Arena<Expr<IdentId>>, Arena<Span>, Option<ExprId>), WithSpan<ParseError>> {
         if self.peek()?.val == Token::EOF {
             return Ok((self.arena_expr, self.arena_span, None));
         }
@@ -436,7 +444,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    pub fn alloc(&mut self, span: Span, expr: Expr) -> ExprId {
+    pub fn alloc(&mut self, span: Span, expr: Expr<IdentId>) -> ExprId {
         self.arena_span.alloc(span);
         self.arena_expr.alloc(expr)
     }
@@ -588,28 +596,27 @@ impl std::fmt::Display for Type {
 }
 
 #[derive(Debug)]
-pub enum SemanticError {
-    UnknownParam,
-    UnknownIdentifier,
+pub enum SemanticError<IdentErr> {
+    UnknownIdentifier(IdentErr),
     TypeMismatch {
         expected: Type,
         found: Type,
     },
 }
 
-pub fn semantic_pass<'src>(
+pub fn semantic_pass<'src, IdentId, IdentErr>(
     src: &'src str,
-    arena_expr: &mut Arena<Expr>,
+    arena_expr: &mut Arena<Expr<IdentId>>,
     arena_span: &Arena<Span>,
     id: ExprId,
-    resolver: &mut impl TypeResolver,
-) -> Result<Type, WithSpan<SemanticError>> {
+    resolver: &mut impl TypeResolver<IdentId, IdentErr>,
+) -> Result<Type, WithSpan<SemanticError<IdentErr>>> {
     let expr = arena_expr.get(id);
-    let mut update: Option<Expr> = None;
+    let mut update = None;
 
     use Expr::*;
 
-    let type_error = |id, et, t| -> WithSpan<SemanticError> {
+    let type_error = |id, et, t| -> WithSpan<SemanticError<IdentErr>> {
         WithSpan {
             val: SemanticError::TypeMismatch {
                 expected: et,
@@ -626,12 +633,12 @@ pub fn semantic_pass<'src>(
         Ident(span) => {
             let path = &src[span.start..span.end];
             let (ty, rid) = resolver.resolve_type(path)
-                .map_err(|e| e.unframe(span))?;
-                update = Some(Sensing(rid));
+                .map_err(|e: WithSpan<IdentErr>| e.unframe(span).map(SemanticError::UnknownIdentifier))?;
+                update = Some(IdentId(rid));
             Ok(ty)
         }
 
-        Sensing(_) => panic!("Cannot re-sanitize"),
+        IdentId(_) => panic!("Cannot re-sanitize"),
 
         Unary { op, expr: inner } => {
             let t = semantic_pass(src, arena_expr, arena_span, inner, resolver)?;
@@ -727,10 +734,10 @@ pub fn semantic_pass<'src>(
     ret
 }
 
-pub fn unregister(
-    arena: &Arena<Expr>,
+pub fn unregister<IdentId: Copy>(
+    arena: &Arena<Expr<IdentId>>,
     id: ExprId,
-    unr: &mut impl FnMut(SensingId),
+    unr: &mut impl FnMut(IdentId),
 ) {
     use Expr::*;
 
@@ -738,7 +745,7 @@ pub fn unregister(
         Bool(_) | Float(_) => (),
 
         Ident(_) => panic!("Cannot unregister un-sanitized"),
-        Sensing(sid) => {
+        IdentId(sid) => {
             unr(*sid);
         }
 
@@ -786,10 +793,10 @@ pub union Value {
     pub float: f64,
 }
 
-pub fn eval_expr(
-    arena: &Arena<Expr>,
+pub fn eval_expr<IdentId: Copy>(
+    arena: &Arena<Expr<IdentId>>,
     id: ExprId,
-    resolver: &impl ValueResolver,
+    resolver: &impl ValueResolver<IdentId>,
 ) -> Value { unsafe {
     let expr = arena.get(id);
 
@@ -797,7 +804,7 @@ pub fn eval_expr(
         Expr::Bool(b) => Value { bool: *b },
         Expr::Float(f) => Value { float: *f },
         Expr::Ident(_span) => panic!("Cannot evaluate un-sanitized Expr"),
-        Expr::Sensing(rid) => {
+        Expr::IdentId(rid) => {
             resolver.resolve_value(*rid)
         }
         Expr::Unary { op, expr: inner } => {
@@ -905,9 +912,9 @@ pub fn eval_expr(
     }
 }}
 
-fn fmt_expr_debug<W: std::fmt::Write> (
+fn fmt_expr_debug<IdentId: std::fmt::Debug, W: std::fmt::Write> (
     src: &str,
-    arena: &Arena<Expr>,
+    arena: &Arena<Expr<IdentId>>,
     id: ExprId,
     f: &mut W,
     indent: usize,
@@ -936,7 +943,7 @@ fn fmt_expr_debug<W: std::fmt::Write> (
             writeln!(f, "Ident({})", &src[s.start..s.end])?;
         }
 
-        Expr::Sensing(r) => {
+        Expr::IdentId(r) => {
             writeln!(f, "Sensing({:?})", r)?;
         }
 
@@ -1026,10 +1033,10 @@ fn unary_prec(_: UnaryOp) -> Prec {
     Prec::Unary
 }
 
-pub fn pretty_print<'src>(
+pub fn pretty_print<'src, IdentId: std::fmt::Debug>(
     f: &mut impl std::fmt::Write,
     src: &str,
-    arena: &Arena<Expr>,
+    arena: &Arena<Expr<IdentId>>,
     root: Option<ExprId>,
 ) -> std::fmt::Result {
     match root {
@@ -1040,10 +1047,10 @@ pub fn pretty_print<'src>(
     }
 }
 
-fn fmt_expr_pretty(
+fn fmt_expr_pretty<IdentId: std::fmt::Debug>(
     f: &mut impl std::fmt::Write,
     src: &str,
-    arena: &Arena<Expr>,
+    arena: &Arena<Expr<IdentId>>,
     id: ExprId,
     parent_prec: Prec,
 ) -> std::fmt::Result {
@@ -1053,7 +1060,7 @@ fn fmt_expr_pretty(
         Expr::Float(_)
         | Expr::Bool(_)
         | Expr::Ident(_)
-        | Expr::Sensing(_) => (Prec::Atom, false),
+        | Expr::IdentId(_) => (Prec::Atom, false),
 
         Expr::Unary { op, .. } =>
             (unary_prec(*op), unary_prec(*op) < parent_prec),
@@ -1086,7 +1093,7 @@ fn fmt_expr_pretty(
             f.write_str(text)?;
         }
 
-        Expr::Sensing(sid) => {
+        Expr::IdentId(sid) => {
             write!(f, "{:?}", sid)?;
         }
 

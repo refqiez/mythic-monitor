@@ -106,6 +106,10 @@ impl<T> WithSpan<T> {
             span: self.span.unframe(parent),
         }
     }
+
+    pub fn into<S>(self) -> WithSpan<S> where T: Into<S> {
+        self.map(T::into)
+    }
 }
 
 impl<T> WithPos<T> {
@@ -116,6 +120,10 @@ impl<T> WithPos<T> {
             pos: self.pos,
             val: f(self.val),
         }
+    }
+
+    pub fn into<S>(self) -> WithPos<S> where T: Into<S> {
+        self.map(T::into)
     }
 }
 

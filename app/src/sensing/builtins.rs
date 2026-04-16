@@ -11,7 +11,7 @@ pub use sys::BuiltinSensor;
 pub mod debug {
     // read sensing values from a file
 
-    use crate::parser::{self, toml, WithPos, lineview};
+    use crate::parser::{self, toml, WithPos, Pos, lineview};
     use crate::base::{app_paths, WriterWrapper};
 
     use std::fs;
@@ -87,18 +87,18 @@ pub mod debug {
             // TODO: they are likely in the order
             for ((name, is_float), val) in self.decls.iter().zip(self.data.iter_mut()) {
                 let ret = if *is_float {
-                    tbl.retrieve::<f64>(name).map(|v| *v.val)
+                    tbl.retrieve::<f64>(name, Some(Pos::nil())).map(|v| v.map(|v| *v.val))
                 } else {
-                    tbl.retrieve::<bool>(name).map(|v| if *v.val {1.0} else {0.0})
+                    tbl.retrieve::<bool>(name, Some(Pos::nil())).map(|v| v.map(|v| if *v.val {1.0} else {0.0}))
                 };
 
                 match ret {
-                    Ok(v) => *val = v,
+                    Ok(Some(v)) => *val = v,
+                    Ok(None) => unreachable!(),
                     // TODO remove _fieldname field?, the caller would know the field name with
                     Err(WithPos { pos, val: toml::RetrieveError::FieldNotFound(_fieldname) }) => {
-                        let (buf, span) = lineview(&src, pos.span);
                         log::debug!("{}", WriterWrapper(|f: &mut std::fmt::Formatter| parser::message_with_evidence(
-                            f, log::Level::Error, &path.as_rel().to_string_lossy(), pos.line, buf, Some(span),
+                            f, log::Level::Error, &path.as_rel().to_string_lossy(), 0, "", None,
                             format_args!("debug sensor '{name}' has not been found, keeping the last value")
                         )));
                     }
@@ -109,6 +109,7 @@ pub mod debug {
                             format_args!("debug sensor '{name}' has {} type but given {}, ignoring new value", expected, found)
                         )));
                     }
+                    Err(WithPos { pos, val: toml::RetrieveError::Negative }) => unreachable!(),
                 }
             }
         }

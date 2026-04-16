@@ -1,3 +1,4 @@
+#![allow(unused)]
 use super::{Span, Pos, WithPos, message_with_evidence};
 
 /// Lexical error
@@ -503,9 +504,10 @@ impl<'src> Parser<'src> {
 }
 
 #[derive(Debug)]
-pub enum RetrieveError<'src> {
-    FieldNotFound(&'src str), // key
-    IncompatibleType(&'static str, &'static str), // key, expected, found
+pub enum RetrieveError {
+    FieldNotFound(String), // key
+    IncompatibleType(&'static str, &'static str), // expected, found
+    Negative,
 }
 
 impl<'src> Table<'src> {
@@ -526,14 +528,25 @@ impl<'src> Table<'src> {
         self.0.extract_if(.., move |e| e.key.val == key)
     }
 
-    pub fn retrieve<'t, T: ExtractValue<'src> + ?Sized>(&'t self, key: &'src str) -> Result<WithPos<&'t T>, WithPos<RetrieveError<'src>>> {
+    // if parent_pos is Some, it returns error for missing entry.
+    // otherwise, it give None
+    pub fn retrieve<'t, 'key, T: ExtractValue<'src> + ?Sized>(&'t self, key: &'key str, parent_pos: Option<Pos>) -> Result<Option<WithPos<&'t T>>, WithPos<RetrieveError>> {
         let Some(entry) = self.get(key) else {
-            return Err(WithPos::nil(RetrieveError::FieldNotFound(key)))
+            return match parent_pos {
+                None => Ok(None),
+                Some(parent_pos) => Err(parent_pos.with(RetrieveError::FieldNotFound(key.to_string()))),
+            };
         };
 
-        entry.val.val.extract::<T>().map_err(move |e|
-            WithPos { pos: entry.val.pos, val: RetrieveError::IncompatibleType(e.expected, e.found) }
-        ).map(|val| WithPos {pos: entry.val.pos, val })
+        entry.val.val.extract::<T>()
+        .map_err(move |e| entry.val.pos.with(RetrieveError::IncompatibleType(e.expected, e.found)))
+        .map(|val| Some(entry.val.pos.with(val)))
+    }
+
+    pub fn retrieve_noneg<'t, 'key>(&'t self, key: &'key str, parent_pos: Option<Pos>) -> Result<Option<WithPos<&'t f64>>, WithPos<RetrieveError>> {
+        let Some(WithPos { val, pos }) = self.retrieve::<f64>(key, parent_pos)? else { return Ok(None) };
+        if *val < 0.0 { return Err(pos.with(RetrieveError::Negative)); }
+        Ok(Some(pos.with(val)))
     }
 
     pub fn get_all_with_prefix<'p>(&self, prefix: &'p str) -> impl Iterator<Item=&Entry<'src>> + use<'_, 'src, 'p> {

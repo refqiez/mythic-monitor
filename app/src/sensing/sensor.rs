@@ -45,10 +45,11 @@ pub struct OpaqueError<'a> {
 pub struct OpaqueErrorOwned {
     pub errcode: u32,
     pub message: Result<String, OpaqueErrorMsgFail<'static>>,
+    pub misc: u16, // used to indicate errorneous identifier fields in 'register'
 }
 
 impl<'a> OpaqueError<'a>  {
-    fn to_owned(&self) -> OpaqueErrorOwned {
+    pub fn to_owned(&self) -> OpaqueErrorOwned {
         let message = match self.message {
             Ok(msg) => Ok(msg.to_string()),
             Err(OpaqueErrorMsgFail::NotUtf8(s)) => {
@@ -62,7 +63,7 @@ impl<'a> OpaqueError<'a>  {
             Err(OpaqueErrorMsgFail::Error(e)) => Err(OpaqueErrorMsgFail::Error(e)),
         };
 
-        OpaqueErrorOwned { errcode: self.errcode, message }
+        OpaqueErrorOwned { errcode: self.errcode, message, misc: self.misc }
     }
 
     fn with_misc(mut self, misc: u16) -> Self {

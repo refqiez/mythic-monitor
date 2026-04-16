@@ -36,12 +36,12 @@ impl AutoSize {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Align {
-    Start,
-    Center,
-    End,
-}
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub enum Align {
+//     Start,
+//     Center,
+//     End,
+// }
 
 
 pub fn o3_hungarian(n: usize, m: usize, cost: impl Fn (usize, usize) -> i32) -> (i32, Vec<usize>) {
@@ -100,6 +100,201 @@ pub fn o3_hungarian(n: usize, m: usize, cost: impl Fn (usize, usize) -> i32) -> 
   // }
 
   (-price_r[0], match_r2l)
+}
+
+#[derive(Debug)]
+pub enum EditOp<T,U> {
+    KeepIt(usize),
+    Update(usize, U),
+    Insert(usize, T),
+    Remove(usize),
+}
+
+#[derive(Debug)]
+pub struct EditOps<T,U>(pub Vec<EditOp<T,U>>);
+
+impl<T,U> EditOps<T,U> {
+    pub fn no_changes(size: usize) -> Self {
+        Self((0..size).map(EditOp::KeepIt).collect())
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, PartialOrd, Ord)]
+enum EditOpDecision {
+    KeepIt,
+    Update,
+    Insert,
+    Remove,
+    Noop,
+}
+
+// Cost should return 0 if identical. Having cost always less than 200 will prevent insert-delete pattern.
+// Use cost u32::MAX if you want the element be always deleted.
+// Returned edit sequence will have semi-strictly decreaseing index, which enables inplace application of the seq.
+// More specifically, for each element in 'a', it will generate one of KeepIt, Update and Remove.
+// For each element missing from A, it will produce Insert at the needed position before progressing to next element on 'a'.
+// KeepIt (and Update) is a adition on the conventional edit script algorithms, being a main reason of this regularity.
+// With that, it seems we don't need to keep indexes in EditOp, but keeping it for future uses.
+pub fn generate_edit_script<S,T>(
+    a: &[S],
+    mut b: Vec<T>,
+    cost: impl Fn(&S, &T) -> u32,
+) -> EditOps<T,T> {
+    use EditOpDecision::*;
+
+    let m = a.len();
+    let n = b.len();
+
+    let del_cost = 100;
+    let ins_cost = 100;
+
+    // dp[i][j] = (minimum cost of a[..i] -> b[..j], decision)
+    let mut dp = vec![vec![(0, Noop); n + 1]; m + 1];
+
+    // initialize
+    for i in 0..=m {
+        dp[i][0] = (del_cost * i as u32, Remove);
+    }
+    for j in 0..=n {
+        dp[0][j] = (ins_cost * j as u32, Insert);
+    }
+    dp[0][0] = (0, Noop);
+
+    // fill DP
+    for i in 1..=m {
+        for j in 1..=n {
+            let del = (dp[i - 1][j].0 + del_cost, Remove);
+            let ins = (dp[i][j - 1].0 + ins_cost, Insert);
+            let subst_cost = cost(&a[i - 1], &b[j - 1]);
+            if subst_cost == u32::MAX {
+                dp[i][j] = del;
+            } else {
+                let subst = (dp[i - 1][j - 1].0 + subst_cost, if subst_cost == 0 { KeepIt } else { Update });
+                dp[i][j] = subst.min(del).min(ins);
+            }
+        }
+    }
+
+    // backtrack
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (m, n);
+
+    loop {
+        match dp[i][j].1 {
+            Remove => {
+                ops.push(EditOp::Remove(i - 1));
+                i -= 1;
+            }
+            Insert => {
+                // let item = b[j - 1].clone();
+                b.truncate(j); let item = b.pop().unwrap();
+                ops.push(EditOp::Insert(i, item));
+                j -= 1;
+            }
+            Update => {
+                // let item = b[j - 1].clone();
+                b.truncate(j); let item = b.pop().unwrap();
+                ops.push(EditOp::Update(i - 1, item));
+                i -= 1; j -= 1;
+            }
+            KeepIt => {
+                ops.push(EditOp::KeepIt(i - 1));
+                i -= 1; j -= 1;
+            }
+            Noop => break,
+        } // INVARIANT: ops.last.idx == i
+    } // INVARIANT: i non-stricly decreases (non-stricity only happens for Insert)
+    debug_assert!(i == 0 && j == 0);
+
+    ops.reverse();
+    // INVARIANT: op.idx increases by 0 or 1; 0 only if op is Insert (in which case j decreases)
+    EditOps(ops)
+}
+
+// example of sequence application
+#[allow(unused)]
+fn apply_edit_script_example<T: Clone>(
+    base: &mut Vec<T>,
+    ops: EditOps<T,T>,
+) {
+    let mut cursor = 0;
+
+    for op in ops.0 {
+        // INVARIANT: base[0..cursor] is fixed
+        match op {
+            EditOp::KeepIt(index) => {
+                cursor += 1;
+            }
+            EditOp::Update(index, value) => {
+                base[cursor] = value;
+                cursor += 1;
+            }
+            EditOp::Remove(index) => {
+                base.remove(cursor);
+            }
+            EditOp::Insert(index, value) => {
+                base.insert(cursor, value);
+                cursor += 1;
+            }
+        }
+    }
+}
+
+// example of sequence application
+#[allow(unused)]
+fn apply_edit_script<T,U>(
+    mut base: impl Iterator<Item=T>,
+    ops: EditOps<T,U>,
+    mut apply: impl FnMut(T, U) -> T,
+) -> Vec<T> {
+    let mut ret = vec![];
+
+    for op in ops.0 {
+        // INVARIANT: base[0..cursor] is fixed
+        match op {
+            EditOp::KeepIt(index) => {
+                ret.push(base.next().unwrap())
+            }
+            EditOp::Update(index, u) => {
+                let t = base.next().unwrap();
+                ret.push(apply(t, u));
+            }
+            EditOp::Remove(index) => {
+                base.next();
+            }
+            EditOp::Insert(index, t) => {
+                ret.push(t);
+            }
+        }
+    }
+
+    ret
+}
+
+#[cfg(test)]
+mod test {
+    use crate::base::apply_edit_script_example;
+
+    use super::generate_edit_script;
+
+    fn test_round_trip_str(a: &str, b: &str) {
+        let mut base: Vec<_> = a.chars().collect();
+        let new: Vec<_> = b.chars().collect();
+
+        let seq = generate_edit_script(&base, new.clone(), |a,b| if a==b {0} else {1});
+        apply_edit_script_example(&mut base, seq);
+        assert_eq!(base, new);
+    }
+
+    #[test]
+    fn test_round_trip_strs() {
+        test_round_trip_str("", "sadfbid");
+        test_round_trip_str("sadfbid", "");
+        test_round_trip_str("sadfbid", "sadfbid");
+        test_round_trip_str("abcdefg", "gbcdfe");
+        test_round_trip_str("abcdefg", "gbe");
+        test_round_trip_str("bde", "gbcdfe");
+    }
 }
 
 
@@ -270,7 +465,6 @@ pub fn is_version_compatible(spec: &str) -> Option<bool> {
         _ => unreachable!(),
     }
 }
-
 
 /// An Iterator wrapper that will enable processing a task on-the-go while report the the caller right away.
 /// If dropped, the iterator will consume itself guraranteeing the task finishes to the end unless halted.

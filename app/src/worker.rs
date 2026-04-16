@@ -1,5 +1,5 @@
-pub mod renderer;
-use renderer::{RenderDataInterface, Renderer};
+pub mod animator;
+use animator::Animator;
 
 pub mod watcher;
 use watcher::DirectoryWatcher;
@@ -7,24 +7,41 @@ use watcher::DirectoryWatcher;
 pub mod poller;
 use poller::SensorPoller;
 
+pub mod decoder;
+use decoder::ClipsDecoder;
+
 use std::sync::{mpsc, Arc, RwLock};
 
 use crate::{
-    base::{self, MYTHIC_VERSION, init_paths, app_paths, log_user, PathInitError, AppPath},
-    sprites::{ClipBank, Sprites},
-    sensing::Sensors,
-    parser::{self, Pos, WithPos, toml::{ParseError, ExtractError}},
+    base::{self, AppPath, MYTHIC_VERSION, PathInitError, app_paths, init_paths, log_user},
+    parser::{self, Pos, WithPos, toml::{ExtractError, ParseError}},
+    sensing::{OpaqueError, Sensors},
+    sprites::{ClipBank, ClipId, Sprites},
 };
 
-use crate::sensing::OpaqueError;
+pub enum SensingUpdate {
+    #[cfg(debug_assertions)]
+    PluginDebugUpdage,
+}
+
+#[derive(Debug)]
+pub enum AnimatorUpdate {
+    UpdateQueued,
+}
+
+pub enum DecoderUpdate {
+    // NewClip(ClipId),
+    Rescan, // from Animator::apply_sprite_update
+    Advanced(ClipId), // from Animator::redraw_sprite
+}
 
 // TODO should be moved to logger?
 pub fn report_opaque_error(name: &str, task: &str, e: OpaqueError) {
-    log_user!("plugin {name} reported error during {task}: {e}");
+    log_user!("plugin '{name}' reported error during {task}: {e}");
 }
 
 fn report_opaque_error_once(name: &str, task: &str, e: OpaqueError) {
-    log_user!("plugin {name} reported error during {task}: {e}; subsequent errors of this type are silenced");
+    log_user!("plugin '{name}' reported error during {task}: {e}; subsequent errors of this type are silenced");
 }
 
 fn attach_parent_console() -> bool {
@@ -279,20 +296,31 @@ pub fn run() -> bool {
     let sensors = Arc::new(RwLock::new(sensors));
     let clipbank = Arc::new(RwLock::new(clipbank));
 
-    let (win_tx, win_rx) = mpsc::channel();
-    let rdi = RenderDataInterface::new(
-        win_rx, sprites.clone(), sensors.clone(), clipbank.clone()
-    );
-    let render_thread = std::thread::Builder::new()
-    .name("render_thread".to_string())
+    // spawn worker threads
+
+    // ClipsDecoder
+    let (dec_tx, dec_rx) = mpsc::channel();
+    let mut decoder = ClipsDecoder::new(clipbank.clone(), dec_rx);
+    let decoder_thread = std::thread::Builder::new()
+    .name("decoder_thread".to_string())
+    .spawn(move || {
+        decoder.run()
+    }).unwrap();
+
+    // Animator
+    let (anim_tx, anim_rx) = mpsc::channel();
+    let cloned_arcs = (sprites.clone(), sensors.clone(), clipbank.clone(), dec_tx.clone());
+    let anim_thread = std::thread::Builder::new()
+    .name("anim_thread".to_string())
     .spawn(|| {
-        // render is not Send, we need to create it inside
-        let mut renderer = Renderer::init(rdi).unwrap();
-        renderer.run().unwrap();
+        // render is not Send (since Windows window APIs are expected to be contained in a thread), we need to create it inside
+        let mut animator = Animator::init(cloned_arcs.0, cloned_arcs.1, cloned_arcs.2,anim_rx, cloned_arcs.3).unwrap();
+        animator.run().unwrap();
         // TODO windows error should make others to shutdown
         // currently, aborts the program
     }).unwrap(); // TODO do more mild shutdown
 
+    // Poller
     let (pol_tx, pol_rx) = mpsc::channel();
     let mut poller = SensorPoller::new(pol_rx, sensors.clone());
     poller.load_all(); // plugins better be loaded before watcher.reload_list_toml
@@ -302,9 +330,8 @@ pub fn run() -> bool {
         poller.run();
     }).unwrap();
 
-    let mut watcher = DirectoryWatcher::new(
-        win_tx, pol_tx, sprites.clone(), sensors.clone(), clipbank.clone()
-    );
+    // DirectoryWatcher
+    let mut watcher = DirectoryWatcher::new(anim_tx, pol_tx, dec_tx, sprites.clone(), sensors.clone(), clipbank.clone());
     let watcher_thread = std::thread::Builder::new()
     .name("watcher_thread".to_string())
     .spawn(move || {
@@ -315,10 +342,14 @@ pub fn run() -> bool {
         // dropping watcher will close mpsc channels, making other threads to exit.
     }).unwrap();
 
+
+    // join and release resources
+
     // join returns Err on thread panic. panics will abort the program, so they are never Err.
     let should_restart = watcher_thread.join().unwrap();
-    render_thread.join().unwrap();
+    anim_thread.join().unwrap();
     poller_thread.join().unwrap();
+    decoder_thread.join().unwrap();
 
     let mut sprites = sprites.write().expect("poisoned sprites lock");
     let mut clipbank = clipbank.write().expect("poisoned clipbank lock");

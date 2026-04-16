@@ -1,7 +1,7 @@
 
 mod pdh;
 
-use pdh::{PdhMetrics, MultiCounterReuseBuffer, PdhArrayAccess, CounterKind, BytesForNameCounterKind};
+use pdh::{PdhMetrics, MultiCounterReuseBuffer, CounterKind, BytesForNameCounterKind};
 
 use super::super::sensor::OpaqueError;
 
@@ -392,16 +392,16 @@ impl BuiltinSensor {
 
         let idmap_idx= match self.idmap.binary_search_by(|x| x.cmp(&item)) {
             Ok(idmap_idx) => {
-                self.idmap[idmap_idx].rc += 1;
 
-                if self.idmap[idmap_idx].rc == 1 {
+                if self.idmap[idmap_idx].rc == 0 {
+                    log::debug!("found hot idmap slot for registration of {path}: {:?}[{}]", self.idmap, idmap_idx);
                     // if recycling empty, the sensing value would have not updated for long
                     let data_idx = self.idmap[idmap_idx].idx;
                     self.data[data_idx] = 0.0;
-                    log::debug!("found hot idmap slot for registration of {path}: {:?}", self.idmap[idmap_idx])
                 } else {
-                    log::debug!("found cold idmap slot for registration of {path}: {:?}", self.idmap[idmap_idx])
+                    log::debug!("found cold idmap slot for registration of {path}: {:?}[{}]", self.idmap, idmap_idx);
                 }
+                self.idmap[idmap_idx].rc += 1;
                 idmap_idx
             }
 
@@ -427,7 +427,7 @@ impl BuiltinSensor {
                 // Furthermore, if an entry in data is empty iff corresponding entry in idmap is empty.
 
                 if let Some((idmap_idx, _)) = recycle {
-                    log::debug!("found empty idmap slot for registration of {path}: {:?}", self.idmap[idmap_idx]);
+                    log::debug!("found empty idmap slot for registration of {path}: {:?}[{}]", self.idmap, idmap_idx);
                     // empty slot in idmap found, use corresponding data slot (also empty)
                     let data_idx = self.idmap[idmap_idx].idx;
                     self.data[data_idx] = 0.0;

@@ -1,6 +1,6 @@
 use crate::base::{AppPath, AppPathAnalisys, analize_path, app_paths, log_user};
 use crate::sensing::{SensorPrepareError, Sensors, OpaqueError};
-use super::watcher::SensingUpdate;
+use super::SensingUpdate;
 use super::{report_opaque_error_once, report_opaque_error};
 
 use std::sync::{mpsc, Arc, RwLock};

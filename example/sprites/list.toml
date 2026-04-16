@@ -15,10 +15,9 @@ version = "0.0"
 [sonic1]
 sprite = "sonic"
 param.sensor = "cpu.ema.06"
-size.width = 100
-size.height = 100
-pos.bottom = 150
-pos.xcenter = 100
+scale = 1
+pos.x = 150
+pos.y = 100
 
 # [sonic2]
 # sprite = "sonic"

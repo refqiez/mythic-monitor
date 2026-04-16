@@ -1,4 +1,4 @@
-use crate::parser::{lineview, message_with_evidence, toml};
+use crate::parser::{lineview, message_with_evidence, toml, Span};
 use crate::base::{app_paths, MYTHIC_VERSION};
 
 use std::io::{LineWriter, Write, stderr};
@@ -145,6 +145,102 @@ where F: Fn(&mut Formatter<'_>) -> FmtRet {
     }
 }
 
+fn general_schema_error_message_with_evidence(
+    f: &mut std::fmt::Formatter,
+    file: &str,
+    lineno: usize,
+    buf: &str,
+    span: Option<Span>,
+    e: &crate::sprites::toml_utils::GeneralSchemaError,
+) -> FmtRet {
+    use crate::sprites::toml_utils::GeneralSchemaError::*;
+    use crate::sprites::toml_utils::VersionError::*;
+    use log::Level::*;
+    match e {
+        Version(Missing) =>
+            message_with_evidence(f, Error, file, 0, "", None,
+                format_args!("version field is missing")
+            ),
+        Version(NonString) =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("version field must be a string")
+            ),
+        Version(Unrecognizable) =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("unrecognizable version value")
+            ),
+        Version(NotCompatible) =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("mythic version is not compatible with current version {}.{}", MYTHIC_VERSION.major, MYTHIC_VERSION.minor)
+            ),
+        UnrecognizedGlobalField =>
+            message_with_evidence(f, Warn, file, lineno, buf, span,
+                format_args!("ignoring unrecognized global field")
+            ),
+        UnrecognizedField =>
+            message_with_evidence(f, Warn, file, lineno, buf, span,
+                format_args!("ignoring unrecognized field")
+            ),
+        Retrieve(toml::RetrieveError::FieldNotFound(field_name)) =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("required field '{field_name}' is missing")
+            ),
+        Retrieve(toml::RetrieveError::IncompatibleType(expected, found)) =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("this field should be '{expected}' but found '{found}'")
+            ),
+        Retrieve(toml::RetrieveError::Negative) =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("this field should be non-negative number")
+            ),
+        PathEmpty =>
+            message_with_evidence(f, Warn, file, lineno, buf, span,
+                format_args!("path string cannot be empty")
+            ),
+        PathAbsolute =>
+            message_with_evidence(f, Warn, file, lineno, buf, span,
+                format_args!("path must be relative to containing file's path")
+            ),
+    }
+}
+
+fn sprite_path_error_message_with_evidence(
+    f: &mut std::fmt::Formatter,
+    file: &str,
+    lineno: usize,
+    buf: &str,
+    span: Option<Span>,
+    e: &crate::sprites::decls::SpritePathError
+) -> FmtRet {
+    use crate::sprites::decls::SpritePathError::*;
+    use log::Level::*;
+    match e {
+        CannotHandlePath =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("sprite path must refer to a toml file or a directory containing one")
+            ),
+        CannotReadDir =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("sprite path refers to a directory but cannot read it")
+            ),
+        MultipleTomlInPath =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("sprite path refers to a directory but there are many toml files to select from")
+            ),
+        NoTomlInPath =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("sprite path refers to a directory but there is no toml file to select")
+            ),
+        NoSuchPath =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("sprite path refers to nothing in the file system")
+            ),
+        IOError(e) =>
+            message_with_evidence(f, Error, file, lineno, buf, span,
+                format_args!("could not load sprite toml file: {e}")
+            ),
+    }
+}
 
 impl<'src> Display for crate::sprites::decls::SpriteDeclLoadReport<'src> {
     fn fmt(&self, f: &mut Formatter) -> FmtRet {
@@ -157,108 +253,31 @@ impl<'src> Display for crate::sprites::decls::SpriteDeclLoadReport<'src> {
         use crate::sprites::decls::SpriteDeclLoadReportKind::*;
 
         match &self.kind {
+            General(e) => general_schema_error_message_with_evidence(f, file, self.pos.line, buf, span, e),
+
             IOError(e) =>
-                message_with_evidence(f, Error, file, 0, buf, None,
+                message_with_evidence(f, Error, file, 0, "", None,
                     format_args!("could not read; {e}")
                 ),
 
-            TomlParseError(parse_error) => {
-                parse_error.message_with_evidence(f, file, self.pos.line, buf, span)
+            TomlParseError(parse_error) =>
+                parse_error.message_with_evidence(f, file, self.pos.line, buf, span),
+
+            SpritePath(e) => if self.src.is_empty() {
+                // if from Sprites::reload_sprite, it does not have list.toml loaded => no evidence
+                sprite_path_error_message_with_evidence(f, file, self.pos.line, "", None, e)
+            } else {
+                sprite_path_error_message_with_evidence(f, file, self.pos.line, buf, span, e)
             }
-
-            Retrieve(retrieve_error) => match retrieve_error {
-                toml::RetrieveError::FieldNotFound(field_name) =>
-                    message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                        format_args!("required field '{field_name}' is missing")
-                    ),
-                toml::RetrieveError::IncompatibleType(expected, found) =>
-                    message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                        format_args!("this field should be '{expected}' but found '{found}'")
-                    ),
-            }
-
-            VersionMissing =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("mythic_version is missing")
-                ),
-            VersionNotString =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("mythic version is not a string")
-                ),
-            VersionUnrecognizable =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("mythic version is unrecognizable")
-                ),
-            VersionNotCompatible =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("mythic version is not compatible with current version {}.{}", MYTHIC_VERSION.major, MYTHIC_VERSION.minor)
-                ),
-            NoHorizontalPosition =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("horizontal position is missing, one of pos.left, pos.xcenter, pos.right should be present")
-                ),
-            NoVerticalPosition =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("vertical position is missing, one of pos.top, pos.ycenter, pos.bottom should be present")
-                ),
-            SpritePathEmtpy =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("sprite path is epmty")
-                ),
-            SpritePatyAbsolute =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                    format_args!("sprite path should be relative to the containing file's path")
-                ),
-            UnrecognizedField =>
-                message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                    format_args!("unrecognized field")
-                ),
-            CannotHandlePath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None,
-                    format_args!("sprite path must refer to a toml file or a directory containing one")
-                ),
-            CannotReadDir =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None,
-                    format_args!("sprite path refers to a directory but cannot read it")
-                ),
-            MultipleTomlInPath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None,
-                    format_args!("sprite path refers to a directory but there are many toml files to select from")
-                ),
-            NoTomlInPath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None,
-                    format_args!("sprite path refers to a directory but there is no toml file to select")
-                ),
-            NoSuchPath =>
-                message_with_evidence(f, Error, file, self.pos.line, buf, None,
-                    format_args!("sprite path refers to nothing in the file system")
-                ),
-            LoadIoError(None) =>
-                message_with_evidence(f, Error, file, self.pos.line, "", None,
-                    format_args!("could not load sprite toml file due to the previous error(s), skipping it")
-                ),
-            LoadIoError(Some(e)) =>
-                message_with_evidence(f, Error, file, self.pos.line, "", None,
-                    format_args!("could not load sprite toml file: {e}")
-                ),
-            UnrecognizedEntry =>
-                message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                    format_args!("unrecognized global field found, ignoring it")
-                ),
-
-            NeedBothSize =>
-                message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                    format_args!("need both with and height be specified")
-                ),
         }
     }
 }
 
 
-impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src, 'a> {
+impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src> {
     fn fmt(&self, f: &mut Formatter) -> FmtRet {
         use log::Level::*;
-        use crate::sprites::{clip, controller::{ConditionError, SpriteSchemaError, ControllerLoadReportKind}};
+        use crate::sprites::{clip, controller::{ConditionError, ControllerLoadReportKind, SchemaError, UnknownIdentifierError}};
         use crate::parser::{expr, Span};
         let (buf, span_) = lineview(self.src, self.pos.span);
         let span = Some(span_);
@@ -273,7 +292,7 @@ impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src
                         message_with_evidence(f, Error, file, self.pos.line, buf, span,
                             format_args!("while loading clip file: {e}")
                         ),
-                    WebPAnimDecoderNew | WebPAnimDecoderGetInfo | WebPAnimDecoderGetNext =>
+                    WebPAnimDecoderOptionsInit | WebPAnimDecoderNew | WebPAnimDecoderGetInfo | WebPAnimDecoderGetNext =>
                         message_with_evidence(f, Error, file, self.pos.line, buf, span,
                             // TODO use more elaborate error message
                             format_args!("while processing clip file: {clipload_error:?}")
@@ -285,8 +304,8 @@ impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src
                 use expr::LexError::*;
                 use expr::ParseError::*;
                 // use expr::SemanticError::*;
-                use crate::sprites::controller::ConditionSemanticError::*;
                 use ConditionError::*;
+                use UnknownIdentifierError::*;
                 match cond_error {
                     SyntaxError(parse_error) => match &parse_error {
                         UnexpectedToken { found, expected, } =>
@@ -315,12 +334,12 @@ impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src
                     }
 
                     SemanticError(semantic_error) => match semantic_error {
-                        UnknownParam(params) => {
-                            let Some(param) = span_.slice(buf).strip_prefix('$') else { panic!() };
+                        expr::SemanticError::UnknownIdentifier(Parameter(cand)) => {
                             message_with_evidence(f, Error, file, self.pos.line, buf, span,
                                 format_args!("this parameter is not recognized (subsequent errors for this parameter may be silenced)")
                             )?;
-                            if let Some(cand) = params.find_fuzzy_match(param) {
+                            if let Some(cand) = cand {
+                                // create fake source buffer
                                 let path = app_paths().sprite_list();
                                 let path = path.as_rel().to_string_lossy();
                                 let buf = format!("param.{} = \"{}\"", cand.key, cand.val);
@@ -331,7 +350,7 @@ impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src
                             }
                             Ok(())
                         }
-                        UnknownIdentifier(uie) => {
+                        expr::SemanticError::UnknownIdentifier(IdentPath(uie)) => {
                             let ident_path = span_.slice(buf);
                             let parameterized = &uie.realpath != ident_path;
 
@@ -357,7 +376,7 @@ impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src
                                 )
                             }
                         }
-                        TypeMismatch { expected, found, } =>
+                        expr::SemanticError::TypeMismatch { expected, found, } =>
                             message_with_evidence(f, Error, file, self.pos.line, buf, span,
                                 format_args!("type mismatch. expected: {expected}, found: {found}")
                             ),
@@ -374,75 +393,26 @@ impl<'src, 'a> Display for crate::sprites::controller::ControllerLoadReport<'src
                 parse_error.message_with_evidence(f, file, self.pos.line, buf, span)
             }
 
-            ControllerLoadReportKind::SchemaError(scheme_error) => {
-                use SpriteSchemaError::*;
+            ControllerLoadReportKind::SpriteSchemaError(scheme_error) => {
+                use SchemaError::*;
                 match scheme_error {
-                    VersionMissing =>
-                        message_with_evidence(f, Error, file, 0, "", None,
-                            format_args!("mythic version is missing")
-                        ),
+                    General(e) => general_schema_error_message_with_evidence(f, file, self.pos.line, buf, span, e),
 
-                    VersionNotString =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                            format_args!("mythic version is not a string")
-                        ),
-                    VersionUnrecognizable =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                            format_args!("mythic version is unrecognizable")
-                        ),
-                    VersionNotCompatible =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                            format_args!("mythic version is not compatible with current version {}.{}", MYTHIC_VERSION.major, MYTHIC_VERSION.minor)
-                        ),
-                    UnrecognizedGlobalField =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("ignoring unrecognized global field")
-                        ),
-                    UnrecognizedField =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("ignoring unrecognized field")
-                        ),
                     UnknownDestState =>
                         message_with_evidence(f, Error, file, self.pos.line, buf, span,
                             format_args!("unknown transition destination, discarding the transition")
-                        ),
-                    NonStringCondition(type_str) =>
-                        message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                            format_args!("transition condition must be string but found {type_str}, using constant 'false' instead.")
-                        ),
-                    ClipWeightNotNumber(found) =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("clip weight must be a number but found {found}, using 0 instead")
-                        ),
-                    ClipWeightNegative =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("clip weight must be positive, using 0 instead")
-                        ),
-                    NotAllowedClipType =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("clip path value must be a string (relative path) or an inline table")
-                        ),
-                    ClipPathMissing =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("clip path is missing")
-                        ),
-                    ClipPathNotString =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("clip path should be a string")
-                        ),
-                    ClipValueEmpty =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("clip path string is empty")
-                        ),
-                    ClipValueAbsolute =>
-                        message_with_evidence(f, Warn, file, self.pos.line, buf, span,
-                            format_args!("clip path must be relative to containing file's path")
                         ),
                     NoAvailableClip =>
                         // message_with_evidence(f, Warn, file, self.pos.line, buf, span,
                         //     format_args!("state '{state_name}' hash no clips to select from, using empty clip")
                         message_with_evidence(f, Error, file, self.pos.line, buf, span,
-                            format_args!("this state has no clips to select from, discarding sprite")
+                            format_args!("this state has no clips to select from")
+                        ),
+                    NoState =>
+                        // message_with_evidence(f, Warn, file, self.pos.line, buf, span,
+                        //     format_args!("state '{state_name}' hash no clips to select from, using empty clip")
+                        message_with_evidence(f, Error, file, 0, "", None,
+                            format_args!("the sprite has states defined, discarding sprite")
                         ),
                 }
             }
@@ -500,6 +470,19 @@ impl<'a> std::fmt::Display for crate::worker::AppInitReport<'a> {
 
 
 impl<'a> Display for crate::sensing::OpaqueError<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        use crate::sensing::OpaqueErrorMsgFail;
+        match self.message {
+            Ok(ref s) => write!(f, "[{}] {}", self.errcode, s),
+            Err(OpaqueErrorMsgFail::Error(e)) => write!(f, "[{}] <ERR {e}>", self.errcode),
+            Err(OpaqueErrorMsgFail::Null) => write!(f, "[{}] <NULL>", self.errcode),
+            Err(OpaqueErrorMsgFail::NotUtf8(s)) =>
+                write!(f, "[{}] {s}{}..<UTF8 ERR>", self.errcode, char::REPLACEMENT_CHARACTER),
+        }
+    }
+}
+
+impl<'a> Display for crate::sensing::OpaqueErrorOwned {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         use crate::sensing::OpaqueErrorMsgFail;
         match self.message {

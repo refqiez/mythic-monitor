@@ -1,11 +1,10 @@
 pub mod clip;
-
-pub use clip::{Clip, ClipBank};
+pub use clip::{ClipBank, ClipId, ClipLoadError, Frame};
 
 pub mod controller;
-
-pub use controller::{SpriteController, Frame, TypeResolver, ValueResolver};
+pub use controller::Controller;
 
 pub mod decls;
+pub use decls::{SpriteDecl, Sprites};
 
-pub use decls::{SpriteDecl, SpriteId, Sprites};
+pub mod toml_utils;

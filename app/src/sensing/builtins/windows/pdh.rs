@@ -189,9 +189,9 @@ impl PdhMetrics {
             // let dxgi_adapters = Self::init_dxgi_adapters();
 
             // Perform initial collection (required for delta-based counters)
-            let ret = PdhCollectQueryData(query);
+            let _ = PdhCollectQueryData(query);
             // assert_eq!(ret, 0);
-            // ignoring the query error; later update errors (during refresh) will be reported.
+            // ignoring initial query error; later update errors (during refresh) will be reported.
 
             Self {
                 query,
@@ -402,13 +402,11 @@ impl PdhMetrics {
 
         let mut num_cores = 0;
         let mut start = 0;
-        // let mut strings = vec![];
         loop {
-            let (len, _) = buffer[start..].iter().enumerate().find(|(i,x)| **x == 0).unwrap();
+            let (len, _) = buffer[start..].iter().enumerate().find(|(_i,x)| **x == 0).unwrap();
             if len == 0 { break; }
 
-            let s = String::from_utf16_lossy(&buffer[start..start+len]);
-            // strings.push(s);
+            // let name = String::from_utf16_lossy(&buffer[start..start+len]);
             num_cores += 1;
             start = start + len + 1;
         }
