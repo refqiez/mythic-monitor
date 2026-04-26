@@ -245,7 +245,7 @@ pub struct Transition {
     cond: ConditionExpr,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 struct ClipInfo {
     path: WithPos<AppPath>,
     weight: f64,
@@ -255,6 +255,19 @@ struct ClipInfo {
     loop_count: Option<u32>,
     lazy_decode: Option<bool>,
     lazy_rescale: Option<bool>,
+}
+
+impl ClipInfo {
+    fn same(&self, other: &Self) -> bool {
+        self.path.val == other.path.val &&
+        self.weight == other.weight &&
+        self.offsetx == other.offsetx &&
+        self.offsety == other.offsety &&
+        self.size == other.size &&
+        self.loop_count == other.loop_count &&
+        self.lazy_decode == other.lazy_decode &&
+        self.lazy_rescale == other.lazy_rescale
+    }
 }
 
 #[derive(Debug)]
@@ -514,8 +527,8 @@ impl<'src, 'caller> StatesLoader<'src, 'caller> {
         let offsetx = (self.get_default::<f64>(&mut table, "offset.x", 0.0) * self.scale) as i32;
         let offsety = (self.get_default::<f64>(&mut table, "offset.y", 0.0) * self.scale) as i32;
         let loop_count = self.get_optional_noneg(&mut table, "loop_count").map(|x| x as u32);
-        let width = self.get_optional_noneg(&mut table, "size.width").map(|x| (x * self.scale) as usize);
-        let height = self.get_optional_noneg(&mut table, "size.height").map(|x| (x * self.scale) as usize);
+        let width = self.get_optional_noneg(&mut table, "size.width").map(|x| x as usize);
+        let height = self.get_optional_noneg(&mut table, "size.height").map(|x| x as usize);
         let lazy_decode = self.get_optional(&mut table,"lazy_decode");
         let lazy_rescale = self.get_optional(&mut table, "lazy_rescale");
 
@@ -523,7 +536,7 @@ impl<'src, 'caller> StatesLoader<'src, 'caller> {
 
         if !unrecoverable {
             Some(ClipInfo {
-            path, weight, offsetx, offsety, size: AutoSize::new(width, height),
+            path, weight, offsetx, offsety, size: AutoSize::new(width, height, self.scale),
             loop_count, lazy_decode, lazy_rescale,
             })
         } else { None }
@@ -533,7 +546,7 @@ impl<'src, 'caller> StatesLoader<'src, 'caller> {
         let path = self.validate_path(path)?;
 
         Ok(ClipInfo {
-            path: pos.with(path), weight: 1.0, loop_count: None, size: AutoSize::new(None, None),
+            path: pos.with(path), weight: 1.0, loop_count: None, size: AutoSize::new(None, None, self.scale),
             offsetx: 0, offsety: 0, lazy_decode: None, lazy_rescale: None,
         })
     }
@@ -653,9 +666,9 @@ impl Controller {
             let mut c = 0;
             if st1.name.val != st2.name.val { c += 30; }
             c += 10 * st1.clips.iter().zip(st2.clips.iter())
-            .filter(|(c1, c2)| c1.0 != c2.0).count() as u32;
+            .filter(|(c1, c2)| c1.0.same(&c2.0)).count() as u32;
             c += 10 * st1.clips.iter().rev().zip(st2.clips.iter().rev())
-            .filter(|(c1, c2)| c1.0 != c2.0).count() as u32;
+            .filter(|(c1, c2)| c1.0.same(&c2.0)).count() as u32;
             c += 20 * st1.clips.len().abs_diff(st2.clips.len()) as u32;
 
             // it is hard to compare transition conditions, so we just assume they are different
@@ -681,7 +694,7 @@ impl Controller {
             // We have to manually find which of the Update pairs actually need Clip load.
             // We will replace transitions for all entries as we have already loaded them.
             Update(idx, mut st) => {
-                let clips_unchanged = self.states[idx].clips.len() == st.clips.len() && self.states[idx].clips.iter().zip(st.clips.iter()).all(|(c1, c2)| c1.0 != c2.0);
+                let clips_unchanged = self.states[idx].clips.len() == st.clips.len() && self.states[idx].clips.iter().zip(st.clips.iter()).all(|(c1, c2)| c1.0.same(&c2.0));
                 if clips_unchanged {
                     let (mut clips, mut trans) = (vec![], vec![]);
                     std::mem::swap(&mut clips, &mut st.clips); // prevent unloading nil ClipId
@@ -724,6 +737,13 @@ impl Controller {
         let (clip_info, clipid) = &state.clips[self.clip_idx];
         let pos = (outer_pos.0 + clip_info.offsetx, outer_pos.1 + clip_info.offsety);
         clipbank.get_current_frame(*clipid, pos)
+    }
+
+    pub fn calc_lazy_rescale<'a>(&self, clipbank: &'a mut ClipBank) {
+        let state = &self.states[self.current_state.0];
+        if state.clips.is_empty() { return }
+        let (clip_info, clipid) = &state.clips[self.clip_idx];
+        clipbank.calc_lazy_rescale(*clipid)
     }
 
     pub fn get_current_clipid(&self) -> Option<ClipId> {

@@ -20,7 +20,7 @@ load2 = "$sensor < 0.6"
 load4_start = "$sensor > 0.8"
 
 [load4_start]
-clip = "crouch.webp"
+clip = { path = "crouch.webp", loop_count = 1 }
 load4 = ""
 
 [load4]

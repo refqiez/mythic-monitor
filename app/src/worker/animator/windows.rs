@@ -253,6 +253,7 @@ impl Animator {
                 };
                 new_windows[new_sprite_idx] = ws;
             }
+            self.windows = new_windows;
         }
     }
 
@@ -273,6 +274,8 @@ impl Animator {
         let mut sprites = self.sprites.write().expect("poisoned sprites lock");
         let mut sensors = self.sensors.write().expect("poisoned sensors lock");
         let mut clipbank = self.clipbank.write().expect("poisoned clipbank lock");
+
+        sprites.calc_lazy_rescale(sprite_idx, &mut clipbank);
         let frame = sprites.get_current_frame(sprite_idx, &clipbank);
 
         let ws = &mut self.windows[sprite_idx];
@@ -292,11 +295,10 @@ impl Animator {
         let dst = POINT { x: x, y: y };
 
         unsafe {
-            ptr::copy_nonoverlapping(
-                frame.pixels.as_ptr(),
-                ws.bits,
-                frame.pixels.len(),
-            );
+            // ptr::copy_nonoverlapping(frame.pixels.as_ptr(), ws.bits, frame.pixels.len());
+            for j in 0 .. height {
+                ptr::copy_nonoverlapping(frame.pixels.as_ptr().add(4*j*width), ws.bits.add(4*j*ws.size.0), 4 * width);
+            }
 
             UpdateLayeredWindow(
                 ws.hwnd,

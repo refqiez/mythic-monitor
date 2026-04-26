@@ -176,7 +176,9 @@ impl DirectoryWatcher {
         let mut sprites = self.sprites.write().expect("poisoned sprites lock");
         let mut sensors = self.sensors.write().expect("poisoned sensors lock");
         let mut clipbank= self.clipbank.write().expect("poisoned clipbank lock");
-        sprites.reload(path, &mut sensors, &mut clipbank)
+        let ret = sprites.reload(path, &mut sensors, &mut clipbank);
+        self.animator_update_queue.send(AnimatorUpdate::UpdateQueued);
+        ret
     }
 
     pub fn reload_sprite_toml(&mut self, path: &AppPath) -> bool {
@@ -186,7 +188,9 @@ impl DirectoryWatcher {
         let mut sprites = self.sprites.write().expect("poisoned sprites lock");
         let mut sensors = self.sensors.write().expect("poisoned sensors lock");
         let mut clipbank= self.clipbank.write().expect("poisoned clipbank lock");
-        sprites.reload_sprite(path, &mut sensors, &mut clipbank)
+        let ret = sprites.reload_sprite(path, &mut sensors, &mut clipbank);
+        self.animator_update_queue.send(AnimatorUpdate::UpdateQueued);
+        ret
     }
 
     pub fn reload_webp(&mut self, path: &AppPath) {

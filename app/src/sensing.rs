@@ -146,7 +146,7 @@ impl Sensors {
             if sid.high == SID_HIGH_DEBUG {
                 let is_float = sid.low & 0x8000 == 0;
                 let value = self.debug.data[(sid.low & 0xFF) as usize];
-                if is_float {
+                return if is_float {
                     Value { float: value }
                 } else {
                     Value { bool: value != 0.0 }

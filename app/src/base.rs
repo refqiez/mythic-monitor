@@ -6,19 +6,28 @@ pub mod path;
 pub use path::{app_paths, init_paths, analize_path, AppPath, PathInitError, AppPathAnalisys};
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AutoSize {
-    pub width: Option<usize>,
-    pub height: Option<usize>,
+    w: Option<usize>,
+    h: Option<usize>,
+    scale: f64,
 }
 
 impl AutoSize {
-    pub fn new(width: Option<usize>, height: Option<usize>) -> Self {
-        Self { width, height }
+    pub fn new(width: Option<usize>, height: Option<usize>, scale: f64) -> Self {
+        Self { w: width, h: height, scale }
+    }
+
+    pub fn width(&self) -> Option<usize> {
+        self.w.map(|w| (w as f64 * self.scale) as usize)
+    }
+
+    pub fn height(&self) -> Option<usize> {
+        self.h.map(|h| (h as f64 * self.scale) as usize)
     }
 
     pub fn complete(&self, width: usize, height: usize) -> (usize, usize) {
-        match (self.width, self.height) {
+        let (w,h) = match (self.w, self.h) {
             (None, None) =>
                 (width, height),
             (Some(w), None) =>
@@ -27,11 +36,13 @@ impl AutoSize {
                 (h * width / height, h),
             (Some(w), Some(h)) =>
                 (w, h)
-        }
+        };
+
+        ((w as f64 * self.scale) as usize, (h as f64 * self.scale) as usize)
     }
 
     pub fn is_complete(&self) -> bool {
-        self.width.is_some() && self.height.is_some()
+        self.w.is_some() && self.h.is_some()
     }
 }
 

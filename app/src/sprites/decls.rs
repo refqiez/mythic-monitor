@@ -494,6 +494,11 @@ impl Sprites {
         controller.get_current_frame(decl.pos, clipbank)
     }
 
+    pub fn calc_lazy_rescale<'a>(&self, sprite_idx: usize, clipbank: &'a mut ClipBank) {
+        let (decl, controller) = &self.decls[sprite_idx]; // TODO report panic to log
+        controller.calc_lazy_rescale(clipbank)
+    }
+
     pub fn get_current_clipid(&self, sprite_idx: usize) -> Option<ClipId> {
         let (_decl, controller) = &self.decls[sprite_idx]; // TODO report panic to log
         controller.get_current_clipid()

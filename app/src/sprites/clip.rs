@@ -22,6 +22,12 @@ pub struct Frame<'a> {
     pub pos: (i32, i32),
 }
 
+impl<'a> std::fmt::Display for Frame<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Frame {{ pixels: [..; {}], delay_ms: {}, size: {:?} pos: {:?} }}", self.pixels.len(), self.delay_ms, self.size, self.pos)
+    }
+}
+
 static WEBP_DATA_ERROR:   &[u8] = include_bytes!("../../../res/error.webp");
 static WEBP_DATA_LOADING: &[u8] = include_bytes!("../../../res/loading.webp");
 
@@ -259,6 +265,8 @@ impl ClipStreamed {
     fn decode_next_frame(&mut self) -> Result<bool, ClipLoadError> { unsafe {
         if WebPAnimDecoderHasMoreFrames(self.decoder.0.as_mut()) == 0 {
             WebPAnimDecoderReset(self.decoder.0.as_mut());
+            self.timestamp_prev = 0;
+            self.current_frame_idx = 0;
             return Ok(false);
         }
 
@@ -276,7 +284,7 @@ impl ClipStreamed {
         if ret == 0 { return Err(ClipLoadError::WebPAnimDecoderGetNext); }
 
         let delay = (timestamp - self.timestamp_prev) as u32;
-        let circ_back_idx = self.circ_front_idx + self.circ_buff_size;
+        let circ_back_idx = (self.circ_front_idx + self.circ_buff_size) % self.buffer_len();
         self.delays[circ_back_idx] = delay;
         self.timestamp_prev = timestamp;
 
@@ -317,17 +325,36 @@ impl ClipStreamed {
         Ok(true)
     }}
 
+    fn calc_lazy_rescale(&mut self) {
+        if self.circ_buff_size == 0 { return; }
+
+        let frame_size = self.frame_size_bytes();
+        let circ_front_offset = self.circ_front_idx * frame_size;
+        let buffer = &self.buffer[circ_front_offset .. circ_front_offset + frame_size];
+
+        let Some(pixels) = self.rescaled.as_mut() else { return };
+
+        let view_frame_size = self.width * self.height * 4;
+        pixels.resize(view_frame_size, 0);
+        unsafe { scale_bilinear(buffer, pixels, self.packed.width, self.packed.height, self.width, self.height); }
+    }
+
     fn get_current_frame(&self, pos: (i32, i32)) -> Frame<'_> {
         if self.circ_buff_size == 0 { return Frame::loading(pos); }
 
-        let frame_size = self.frame_size_bytes();
-        let circ_front_offset = self.circ_front_idx % self.buffer_len();
-        let pixels = &self.buffer[circ_front_offset .. circ_front_offset + frame_size];
         let delay = self.delays[self.circ_front_idx];
+
+        let pixels = if let Some(mut pixels) = self.rescaled.as_ref() {
+            &pixels
+        } else {
+            let frame_size = self.frame_size_bytes();
+            let circ_front_offset = self.circ_front_idx * frame_size;
+            &self.buffer[circ_front_offset .. circ_front_offset + frame_size]
+        };
 
         Frame {
             pixels, delay_ms: delay, pos,
-            size: (self.packed.width, self.packed.height),
+            size: (self.width, self.height),
         }
     }
 
@@ -341,7 +368,7 @@ impl ClipStreamed {
     }
 
     fn buffer_len(&self) -> usize {
-        self.buffer.len() / self.frame_size_bytes()
+        self.delays.len()
     }
 
     fn decode_shortfall(&self) -> usize {
@@ -446,6 +473,14 @@ impl Clip {
             Clip::Unpacked(_cu) => Ok(true),
         }
     }
+
+    pub fn calc_lazy_rescale(&mut self) {
+        match self {
+            Clip::Streamed(cs) => cs.calc_lazy_rescale(),
+            Clip::Unpacked(_cu) => (),
+        }
+    }
+
 }
 
 impl std::fmt::Debug for ClipStreamed {
@@ -607,7 +642,7 @@ impl ClipBank {
             self.load_clip_streamed(path, size, max_decoded_frames, lazy_rescale, loop_count)
         }?;
 
-        log::debug!("clipbank.load_clip('{}', {:?}, {:?}) => {:?} {:?}", path, size.width, size.height, self.get(clipid), clipid);
+        log::debug!("clipbank.load_clip('{}', {:?}, {:?}) => {:?} {:?}", path, size.width(), size.height(), self.get(clipid), clipid);
         Ok(clipid)
     }
 
@@ -646,6 +681,14 @@ impl ClipBank {
             return 1;
         };
         clip.loop_count()
+    }
+
+    pub fn calc_lazy_rescale(&mut self, clipid: ClipId) {
+        let Some(clip) = self.get_mut(clipid) else {
+            log::error!("tried to get calc rescale on an unknown clipid {clipid:?}");
+            return;
+        };
+        clip.calc_lazy_rescale()
     }
 
     pub fn get_current_frame(&self, clipid: ClipId, pos: (i32, i32)) -> Frame<'_> {

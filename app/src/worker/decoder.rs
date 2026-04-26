@@ -60,11 +60,16 @@ impl ClipsDecoder {
     pub fn run(&mut self) {
         // TODO we may do load spreading to avoid cpu usage peak?
         loop {
-            while let Some((shortfall, clipid)) = self.decode_queue.pop() {
-                if self.clipbank.read().expect("poisoned clipbank lock").get_decode_shortfall(clipid) < shortfall { continue; } // stale signal
+            while let Some((shortfall_signal, clipid)) = self.decode_queue.pop() {
+                let shortfall = self.clipbank.read().expect("poisoned clipbank lock").get_decode_shortfall(clipid);
+                if shortfall < shortfall_signal { continue; } // stale signal
 
                 let mut clipbank = self.clipbank.write().expect("poisoned clipbank lock");
                 clipbank.decode_next_frame(clipid);
+
+                if shortfall > 1 {
+                    self.decode_queue.push((shortfall-1, clipid));
+                }
 
                 if ! Self::consume_all_updates(&mut self.decode_queue, &mut self.update_queue, &clipbank) { return; }
             }

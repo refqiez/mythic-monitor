@@ -456,3 +456,8 @@ See LICENSE.txt for details.
     + would be helpful when testing plugins
 - [ ] make toml/expr work on unicodes.
     + and other string related funcs (especially from base.rs)
+- [ ] use ClipUnpacked when frame_count <= max buffer
+- [ ] let default loopcount be 1
+- [ ] generate single-time use paths, keep multi-use paths in AppPathGlobal
+- [ ] make builtin sensor to report windows error code
+- [ ] use more extensive trace logging
