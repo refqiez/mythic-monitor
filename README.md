@@ -435,6 +435,10 @@ The plugin increament internal timer with every refresh, skipping when refcount 
 
 <!-- # Performance -- TODO -->
 
+# Architecture
+
+See [Architecture.md](./Architecture.md)
+
 # License
 
 This project is licensed under the GNU GPL v3.0 or later.
